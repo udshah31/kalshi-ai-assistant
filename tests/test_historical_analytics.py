@@ -98,6 +98,51 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         self.insert_forecast("timely", ticker="ticker-0", issued_at=START + 120)
         self.assertEqual([row["forecast_id"] for row in read_recent_forecasts(self.state_file)["rows"]], ["timely"])
 
+    def test_snapshot_conflicts_are_excluded_before_ticker_deduplication_and_scoring(self):
+        for index in range(25):
+            opened = START + index * 900
+            conflict = (
+                {"ticker": "other"}, {"ticker": None},
+                {"open_time": opened + 1}, {"open_time": None},
+                {"close_time": opened + 901},
+            )[index % 5]
+            self.insert_forecast(f"invalid-{index}", index, probability=.2,
+                                 result="yes", snapshot_changes=conflict)
+            self.insert_forecast(f"valid-{index}", index, issued_at=opened + 80,
+                                 result="yes")
+        self.write_validation_summary(self.validation_summary(scored_count=25, eligible_count=25))
+        rows = read_recent_forecasts(self.state_file)["rows"]
+        self.assertEqual([row["forecast_id"] for row in rows],
+                         [f"valid-{index}" for index in reversed(range(25))])
+        point = read_historical_analytics(self.state_file)["trend"][0]
+        self.assertEqual(point["count"], 25)
+        self.assertEqual(point["accuracy"], 1)
+        self.assertAlmostEqual(point["brier_score"], .04)
+
+    def test_snapshot_conflicts_without_a_valid_retry_cannot_form_a_trend(self):
+        for index in range(25):
+            self.insert_forecast(f"invalid-{index}", index, result="yes",
+                                 snapshot_changes={"close_time": "invalid"})
+        self.assertEqual(read_recent_forecasts(self.state_file)["rows"], [])
+        self.assertEqual(read_historical_analytics(self.state_file)["trend"], [])
+
+    def test_missing_optional_snapshot_identity_fields_remain_canonical(self):
+        for index, missing in enumerate(("ticker", "open_time", "close_time")):
+            opened = START + index * 900
+            snapshot = {"ticker": f"ticker-{index}", "open_time": opened,
+                        "close_time": opened + 900}
+            snapshot.pop(missing)
+            self.insert_forecast(f"earliest-{index}", index, result="yes",
+                                 snapshot_json=json.dumps(snapshot))
+            self.insert_forecast(f"later-{index}", index, issued_at=opened + 80, result="no")
+        rows = read_recent_forecasts(self.state_file)["rows"]
+        self.assertEqual([row["forecast_id"] for row in rows],
+                         ["earliest-2", "earliest-1", "earliest-0"])
+        for row in rows:
+            self.assertEqual(row["timing_status"], "unknown")
+            self.assertIsNone(row["yes_mid"])
+            self.assertEqual(row["result"], "yes")
+
     def test_missing_or_malformed_snapshot_preserves_unknown_timing_and_midpoint(self):
         for index, snapshot in enumerate(("null", "{}", "{incomplete", "[]")):
             self.insert_forecast(f"unknown-{index}", index, snapshot_json=snapshot)
@@ -164,6 +209,29 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                 self.assertNotIn(str(path), json.dumps(result))
             self.assertEqual(path.read_bytes(), contents)
 
+    def test_archive_connection_failure_returns_safe_unavailable_payloads(self):
+        error = f"private connection failure: {archive_path(self.state_file)}"
+        with patch("forecast_archive.sqlite3.connect", side_effect=sqlite3.OperationalError(error)):
+            for query in (read_recent_forecasts, read_historical_analytics):
+                with self.subTest(query=query.__name__):
+                    result = query(self.state_file)
+                    self.assertEqual(result["status"], "unavailable")
+                    self.assertNotIn(error, json.dumps(result))
+                    self.assertNotIn(str(self.state_file.parent), json.dumps(result))
+                    if query is read_recent_forecasts:
+                        self.assertEqual(result["rows"], [])
+                    else:
+                        self.assertEqual(result["trend"], [])
+                        self.assertIsNone(result["summary"]["accuracy"])
+                        self.assertFalse(result["validation_ready"])
+
+    def test_invalid_limits_still_raise_when_archive_connection_fails(self):
+        with patch("forecast_archive.sqlite3.connect", side_effect=sqlite3.OperationalError("unavailable")):
+            for query in (read_recent_forecasts, read_historical_analytics):
+                for limit in (0, 26, True):
+                    with self.subTest(query=query.__name__, limit=limit), self.assertRaises(ValueError):
+                        query(self.state_file, limit)
+
     def test_queries_do_not_write_state_archive_reports_or_journal_mode(self):
         self.insert_forecast("settled", result="yes")
         self.state_file.write_text("unchanged-live-state")
@@ -179,14 +247,16 @@ class HistoricalAnalyticsTests(unittest.TestCase):
     @staticmethod
     def validation_summary(*, generated_at=None, scored_count=35, eligible_count=35):
         generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+        status = "insufficient_data" if scored_count < 100 else "descriptive_evaluation"
         metrics = {
-            "count": scored_count, "accuracy": .6, "brier_score": .2,
-            "accuracy_wilson_95": {"lower": .4, "upper": .75},
+            "count": scored_count, "accuracy": .6 if scored_count else None,
+            "brier_score": .2 if scored_count else None,
+            "accuracy_wilson_95": {"lower": .4, "upper": .75} if scored_count else None,
         }
-        constant = {"count": scored_count, "brier_score": .25}
+        constant = {"count": scored_count, "brier_score": .25 if scored_count else None}
         return {
             "schema_version": 1, "generated_at": generated_at,
-            "status": "insufficient_data", "calibration_applied_live": False,
+            "status": status, "calibration_applied_live": False,
             "limitations": ["descriptive"],
             "data_quality": {
                 "status": "insufficient_data",
@@ -206,7 +276,7 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                 "baselines": {"constant_50_percent": constant},
             },
             "walk_forward": {
-                "status": "insufficient_data", "scored_count": scored_count,
+                "status": status, "scored_count": scored_count,
                 "test_count": scored_count, "minimum_evidence_samples": 100,
                 "additional_scored_samples_needed": max(0, 100 - scored_count),
             },
@@ -245,6 +315,26 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         self.assertEqual(result["freshness"]["status"], "fresh")
         json.dumps(result, allow_nan=False)
         self.assertTrue(all(isinstance(point["issued_at"], float) for point in result["trend"]))
+
+    def test_historical_limit_keeps_newest_points_after_full_window_calculation(self):
+        # 157 rows produce 27 complete windows, with two rows after the last stride.
+        for index in range(157):
+            self.insert_forecast(f"forecast-{index}", index,
+                                 result="yes" if index % 2 == 0 else "no")
+        self.write_validation_summary(self.validation_summary(scored_count=157, eligible_count=157))
+        trend = read_historical_analytics(self.state_file)["trend"]
+        self.assertEqual(len(trend), 25)
+        self.assertEqual([point["issued_at"] for point in trend],
+                         [START + index * 900 + 60 for index in range(34, 155, 5)])
+        for limit, indices, accuracies in ((1, (154,), (.52,)), (2, (149, 154), (.48, .52))):
+            with self.subTest(limit=limit):
+                result = read_historical_analytics(self.state_file, limit=limit)
+                self.assertEqual(result["status"], "available")
+                self.assertEqual([point["issued_at"] for point in result["trend"]],
+                                 [START + index * 900 + 60 for index in indices])
+                self.assertEqual([point["count"] for point in result["trend"]], [25] * limit)
+                self.assertEqual([point["accuracy"] for point in result["trend"]], list(accuracies))
+                self.assertAlmostEqual(result["trend"][-1]["brier_score"], .328)
 
     def test_trend_omits_metrics_when_window_has_fewer_than_ten_known_labels(self):
         for index in range(25):
@@ -296,6 +386,50 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         future = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
         self.write_validation_summary(self.validation_summary(generated_at=future))
         self.assertEqual(read_historical_analytics(self.state_file)["status"], "unavailable")
+
+    def test_impossible_constant_50_brier_is_unavailable(self):
+        invalid = self.validation_summary()
+        invalid["forward"]["baselines"]["constant_50_percent"]["brier_score"] = .9
+        self.write_validation_summary(invalid)
+        result = read_historical_analytics(self.state_file)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["summary"]["constant_50_brier"])
+
+    def test_walk_forward_counts_cannot_exceed_forward_population(self):
+        for eligible, walk_scored, walk_tested in ((35, 35, 36), (35, 36, 36), (40, 41, 41)):
+            with self.subTest(eligible=eligible, scored=walk_scored, tested=walk_tested):
+                invalid = self.validation_summary(eligible_count=eligible)
+                invalid["walk_forward"].update({
+                    "scored_count": walk_scored, "test_count": walk_tested,
+                    "additional_scored_samples_needed": 100 - walk_scored,
+                })
+                self.write_validation_summary(invalid)
+                result = read_historical_analytics(self.state_file)
+                self.assertEqual(result["status"], "unavailable")
+                self.assertIsNone(result["walk_forward"]["scored_count"])
+
+    def test_walk_forward_status_must_match_minimum_scored_target(self):
+        for scored, status in ((99, "descriptive_evaluation"), (100, "insufficient_data")):
+            with self.subTest(scored=scored, status=status):
+                invalid = self.validation_summary(scored_count=scored, eligible_count=125)
+                invalid["walk_forward"]["status"] = status
+                self.write_validation_summary(invalid)
+                result = read_historical_analytics(self.state_file)
+                self.assertEqual(result["status"], "unavailable")
+                self.assertIsNone(result["walk_forward"]["status"])
+
+    def test_report_invariants_allow_empty_and_target_boundary_populations(self):
+        for scored, status in ((0, "insufficient_data"), (99, "insufficient_data"),
+                               (100, "descriptive_evaluation")):
+            with self.subTest(scored=scored):
+                report = self.validation_summary(scored_count=scored, eligible_count=125)
+                report["walk_forward"]["test_count"] = 125
+                self.write_validation_summary(report)
+                result = read_historical_analytics(self.state_file)
+                self.assertEqual(result["status"], "available")
+                self.assertEqual(result["walk_forward"]["status"], status)
+                self.assertEqual(result["walk_forward"]["scored_count"], scored)
+                self.assertEqual(result["summary"]["constant_50_brier"], .25 if scored else None)
 
 
 if __name__ == "__main__":

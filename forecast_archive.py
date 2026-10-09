@@ -192,6 +192,24 @@ def _snapshot_timing(snapshot: dict[str, Any] | None, ticker: str,
     return "timely" if _timing_from_archive(bar, issued_at) == "timely" else "late"
 
 
+def _snapshot_conflicts(snapshot: dict[str, Any] | None, ticker: str,
+                        bar_timestamp: Any) -> bool:
+    """Reject supplied identity/interval conflicts while preserving unknown fields."""
+    if snapshot is None:
+        return False
+    bar = _number(bar_timestamp)
+    if bar is None:
+        return True
+    expected_open = bar + 900
+    expected_close = bar + 1800
+    if "ticker" in snapshot and snapshot["ticker"] != ticker:
+        return True
+    for key, expected in (("open_time", expected_open), ("close_time", expected_close)):
+        if key in snapshot and _timestamp(snapshot.get(key)) != expected:
+            return True
+    return False
+
+
 def _snapshot_midpoint(snapshot: dict[str, Any] | None, ticker: str,
                        bar_timestamp: Any, issued_at: float) -> float | None:
     if _snapshot_timing(snapshot, ticker, bar_timestamp, issued_at) != "timely":
@@ -258,10 +276,12 @@ def _canonical_archive_rows(connection: sqlite3.Connection) -> list[dict[str, An
         # canonical set as a late forecast.
         if _timing_from_archive(bar_timestamp, issued_at) != "timely":
             continue
+        snapshot = _json_object(row["market_snapshot_json"])
+        if _snapshot_conflicts(snapshot, ticker, bar_timestamp):
+            continue
         if ticker in seen_tickers:
             continue
         seen_tickers.add(ticker)
-        snapshot = _json_object(row["market_snapshot_json"])
         result, available, delay = _settlement_values(
             row, issued_at, bar_timestamp + 1800, ticker)
         probability = _number(row["probability_up"])
@@ -294,17 +314,19 @@ def _recent_result(row: dict[str, Any]) -> dict[str, Any]:
 def read_recent_forecasts(state_file: str | Path, limit: int = 25) -> dict[str, Any]:
     """Read a bounded table of frozen official forecasts without creating evidence."""
     _analytics_limit(limit)
-    connection = _connect_archive_readonly(state_file)
-    if connection is None:
-        return {"status": "pending", "reason": "Awaiting the first archived forecasts.", "rows": []}
+    connection = None
     try:
+        connection = _connect_archive_readonly(state_file)
+        if connection is None:
+            return {"status": "pending", "reason": "Awaiting the first archived forecasts.", "rows": []}
         with closing(connection):
             records = _canonical_archive_rows(connection)
         records.sort(key=lambda row: (row["issued_at"], row["forecast_id"]), reverse=True)
         return {"status": "available", "rows": [_recent_result(row) for row in records[:limit]]}
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
         try:
-            connection.close()
+            if connection is not None:
+                connection.close()
         except Exception:
             pass
         return {"status": "unavailable", "reason": "Archived forecasts are unavailable.", "rows": []}
@@ -367,7 +389,8 @@ def _report_projection(report: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(constant, dict) or type(constant.get("count")) is not int or constant["count"] != scored:
         raise ValueError("contradictory baseline count")
     constant_brier = _number(constant.get("brier_score"))
-    if scored and (constant_brier is None or not 0 <= constant_brier <= 1):
+    if scored and (constant_brier is None or not 0 <= constant_brier <= 1
+                   or not math.isclose(constant_brier, .25, rel_tol=0, abs_tol=1e-9)):
         raise ValueError("invalid baseline metric")
     if not scored and constant.get("brier_score") is not None:
         raise ValueError("invalid empty baseline metric")
@@ -379,9 +402,10 @@ def _report_projection(report: dict[str, Any]) -> dict[str, Any]:
     if (any(type(value) is not int or value < 0 for value in (walk_scored, walk_tested))
             or type(walk_minimum) is not int or walk_minimum < 1
             or type(walk_additional) is not int or walk_additional < 0
-            or walk_scored > walk_tested
+            or walk_scored > walk_tested or walk_tested > eligible
             or walk_additional != max(0, walk_minimum - walk_scored)
-            or walk.get("status") not in {"descriptive_evaluation", "insufficient_data"}):
+            or walk.get("status") != (
+                "descriptive_evaluation" if walk_scored >= walk_minimum else "insufficient_data")):
         raise ValueError("contradictory walk-forward counts")
 
     collection = data_quality.get("collection_quality")
@@ -446,8 +470,7 @@ def _rolling_trend(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return trend
 
 
-def _analytics_with_report(records: list[dict[str, Any]], report: dict[str, Any],
-                           trend: list[dict[str, Any]]) -> dict[str, Any]:
+def _analytics_with_report(report: dict[str, Any], trend: list[dict[str, Any]]) -> dict[str, Any]:
     projection = _report_projection(report)
     generated_at = _timestamp(projection["generated_at"])
     now = time.time()
@@ -475,21 +498,23 @@ def _analytics_with_report(records: list[dict[str, Any]], report: dict[str, Any]
 def read_historical_analytics(state_file: str | Path, limit: int = 25) -> dict[str, Any]:
     """Read descriptive archive evidence independently of live prediction state."""
     _analytics_limit(limit)
-    connection = _connect_archive_readonly(state_file)
-    if connection is None:
-        return _analytics_base("pending", "Awaiting the first archived forecasts.")
+    connection = None
     trend: list[dict[str, Any]] = []
     try:
+        connection = _connect_archive_readonly(state_file)
+        if connection is None:
+            return _analytics_base("pending", "Awaiting the first archived forecasts.")
         with closing(connection):
             records = _canonical_archive_rows(connection)
-        trend = _rolling_trend(records)
+        trend = _rolling_trend(records)[-limit:]
         report = read_validation_summary(state_file)
         if report.get("status") in {"pending", "unavailable"}:
             return _analytics_base(report["status"], report.get("reason"), trend)
-        return _analytics_with_report(records, report, trend)
+        return _analytics_with_report(report, trend)
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
         try:
-            connection.close()
+            if connection is not None:
+                connection.close()
         except Exception:
             pass
         return _analytics_base("unavailable", "Historical analytics are unavailable.", trend)
