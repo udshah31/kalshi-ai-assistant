@@ -216,6 +216,31 @@ class DashboardContextTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertEqual(payload, {"error": "invalid analytics limit"})
 
+    def test_analytics_api_normalizes_sensitive_saved_report_reasons(self):
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        validation_summary = forecast_archive.validation_paths(self.state)[1]
+        sensitive_text = (
+            "/private/analytics/state.json", "token=synthetic-test-secret",
+            "Traceback (most recent call last)",
+        )
+        for report_status, public_reason in (
+            ("pending", "Awaiting historical analytics evidence."),
+            ("unavailable", "Historical analytics are unavailable."),
+        ):
+            with self.subTest(status=report_status):
+                validation_summary.write_text(json.dumps({
+                    "status": report_status, "reason": "\n".join(sensitive_text),
+                }), encoding="utf-8")
+                status, payload = self.get_json("/api/analytics")
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], report_status)
+                self.assertFalse(payload["validation_ready"])
+                serialized = json.dumps(payload, allow_nan=False)
+                for text in sensitive_text:
+                    self.assertNotIn(text, serialized)
+                self.assertEqual(payload["reason"], public_reason)
+
     def test_missing_or_malformed_analytics_reports_are_safe_and_read_only(self):
         status, payload = self.get_json("/api/analytics")
         self.assertEqual(status, 200)
@@ -226,8 +251,18 @@ class DashboardContextTests(unittest.TestCase):
         self.assertFalse(self.state.exists())
         self.assertFalse(forecast_archive.archive_path(self.state).exists())
 
-        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
-            pass
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)) as connection:
+            for index in range(3):
+                bar_timestamp = 1800000000 + index * 900
+                issued_at = bar_timestamp + 960
+                connection.execute("""INSERT INTO forecasts (
+                    forecast_id, state_id, bar_timestamp, market_ticker,
+                    forecast_issued_at, probability_up, validation_eligible,
+                    outcome_source, provenance, captured_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)""", (
+                    f"forecast-{index}", "test-state", bar_timestamp, f"ticker-{index}",
+                    issued_at, .6, 1, "kalshi_official", "live_archive", issued_at,
+                ))
         self.state.write_bytes(b"existing-live-state")
         validation_summary = forecast_archive.validation_paths(self.state)[1]
         validation_summary.write_bytes(b"{ malformed")
@@ -238,6 +273,18 @@ class DashboardContextTests(unittest.TestCase):
         self.assertEqual(payload["status"], "unavailable")
         self.assertFalse(payload["validation_ready"])
         self.assertNotIn("traceback", json.dumps(payload).lower())
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        status, payload = self.get_json("/api/analytics/forecasts?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "available")
+        self.assertEqual([row["forecast_id"] for row in payload["rows"]],
+                         ["forecast-2", "forecast-1"])
+        for row in payload["rows"]:
+            self.assertEqual(row["probability_up"], .6)
+            self.assertEqual(row["timing_status"], "unknown")
+            self.assertFalse(row["market_midpoint_available"])
+            for key in ("result", "yes_mid", "settlement_available_at", "settlement_delay_seconds"):
+                self.assertIsNone(row[key])
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
 

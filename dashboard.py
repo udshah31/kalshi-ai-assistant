@@ -571,7 +571,13 @@ class DashboardApp:
         return read_context_comparison(self.state_file)
 
     def analytics(self) -> dict[str, Any]:
-        return read_historical_analytics(self.state_file)
+        payload = read_historical_analytics(self.state_file)
+        # Saved-report reasons may contain private diagnostics; publish fixed text.
+        if payload.get("status") == "pending":
+            payload["reason"] = "Awaiting historical analytics evidence."
+        elif payload.get("status") == "unavailable":
+            payload["reason"] = "Historical analytics are unavailable."
+        return payload
 
     def recent_forecasts(self, limit: int) -> dict[str, Any]:
         return read_recent_forecasts(self.state_file, limit)
