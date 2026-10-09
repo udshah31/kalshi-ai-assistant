@@ -154,6 +154,49 @@ HTML = r"""<!doctype html>
     .context-progress { display: block; width: 100%; height: 8px; margin: 10px 0 7px; accent-color: var(--blue); }
     .context-footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-top: 14px; }
     #context-conclusion { margin: 16px 0 6px; }
+    .analytics-panel { grid-column: span 12; min-width: 0; }
+    .analytics-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    .analytics-panel h2 { margin: 0 0 6px; font-size: 24px; letter-spacing: -.035em; }
+    .analytics-panel h3 { margin: 0 0 8px; font-size: 17px; }
+    .analytics-panel p { max-width: 78ch; }
+    .analytics-heading p { margin: 0; }
+    .analytics-warning { padding: 12px 16px; border: 1px solid var(--yellow); border-left-width: 4px; border-radius: 8px; color: var(--yellow); background: rgba(255,209,102,.08); line-height: 1.5; }
+    .analytics-status-stale { color: var(--yellow); }
+    .analytics-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }
+    .analytics-stat { background: var(--panel-strong); border-radius: 12px; padding: 16px; }
+    .analytics-stat dt { color: var(--muted); font-size: 13px; }
+    .analytics-stat dd { margin: 8px 0 0; font-size: 27px; font-weight: 750; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
+    .analytics-stat .small { display: block; margin-top: 8px; font-weight: 400; letter-spacing: normal; }
+    .analytics-columns { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 22px; margin: 24px 0; }
+    .analytics-columns > * { min-width: 0; }
+    .analytics-coverage { border-left: 1px solid var(--line); padding-left: 22px; }
+    .analytics-coverage dl { margin: 14px 0; }
+    .analytics-coverage dl > div { display: flex; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding: 9px 0; }
+    .analytics-coverage dt { color: var(--muted); font-size: 13px; }
+    .analytics-coverage dd { margin: 0; font-size: 14px; font-variant-numeric: tabular-nums; }
+    .analytics-plot { margin: 16px 0 8px; }
+    .analytics-plot h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+    .analytics-plot svg { display: block; width: 100%; height: auto; }
+    .analytics-plot text { fill: var(--muted); font-size: 12px; }
+    .analytics-plot .plot-grid { stroke: var(--line); stroke-width: 1; }
+    .analytics-plot .plot-series { stroke: var(--blue); fill: none; stroke-width: 2; }
+    .analytics-plot circle { fill: var(--blue); }
+    .analytics-plot.brier .plot-series { stroke: var(--yellow); }
+    .analytics-plot.brier circle { fill: var(--yellow); }
+    .analytics-panel details > summary { padding: 12px 0; color: var(--blue); cursor: pointer; font-size: 13px; }
+    .analytics-scroll { max-width: 100%; overflow: auto; max-height: 420px; border: 1px solid var(--line); border-radius: 10px; }
+    .analytics-scroll:focus-visible, .analytics-panel summary:focus-visible { outline: 2px solid var(--yellow); outline-offset: 3px; }
+    .analytics-table { border-collapse: collapse; width: 100%; min-width: 980px; font-size: 13px; }
+    .analytics-table.trend-values { min-width: 500px; }
+    .analytics-table caption { text-align: left; padding: 12px; color: var(--muted); }
+    .analytics-table th, .analytics-table td { padding: 12px; text-align: left; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+    .analytics-table thead th { position: sticky; top: 0; background: var(--panel-strong); color: var(--muted); font-weight: 600; }
+    .analytics-table tbody th { font-weight: 500; overflow-wrap: anywhere; min-width: 140px; max-width: 220px; }
+    .analytics-table td { min-width: 85px; }
+    .analytics-table .analytics-time { min-width: 150px; }
+    #analytics-message { overflow-wrap: anywhere; }
+    #analytics-updated, #analytics-trend-time, #analytics-forecasts-updated { font-variant-numeric: tabular-nums; }
+    @media (prefers-reduced-motion: reduce) { .bar > span { transition: none; } }
     [hidden] { display: none !important; }
     @media (max-width: 760px) {
       .shell { width: min(100% - 22px, 600px); padding-top: 26px; }
@@ -164,6 +207,10 @@ HTML = r"""<!doctype html>
       .context-heading { flex-direction: column; gap: 10px; }
       .context-inputs { grid-template-columns: 1fr; }
       .context-scroll-hint { display: block; margin: 8px 0 0; }
+      .analytics-heading { flex-direction: column; }
+      .analytics-summary, .analytics-columns { grid-template-columns: minmax(0, 1fr); }
+      .analytics-coverage { border-left: 0; border-top: 1px solid var(--line); padding: 18px 0 0; }
+      .analytics-plot text { font-size: 22px; }
     }
   </style>
 </head>
@@ -243,6 +290,61 @@ HTML = r"""<!doctype html>
           <p class="small">Only the two longer returns change. The 15m return, EMA, volatility, volume and range stay fixed. Report refreshes hourly at minute 05 UTC.</p>
         </div>
       </article>
+
+      <section id="historical-analytics" class="card analytics-panel" aria-labelledby="analytics-title">
+        <div class="analytics-heading">
+          <div>
+            <h2 id="analytics-title">Historical analytics</h2>
+            <p class="small">Frozen official forecasts and saved evaluation evidence.</p>
+          </div>
+          <span id="analytics-status" class="pill" role="status">Loading analytics…</span>
+        </div>
+        <p id="analytics-warning" class="analytics-warning" role="status" hidden></p>
+        <p id="analytics-message" class="small">Analytics are unavailable until the first response arrives.</p>
+        <p id="analytics-updated" class="small">Report updated —; age at refresh —</p>
+        <dl id="analytics-summary" class="analytics-summary">
+          <div class="analytics-stat"><dt>Eligible / sample threshold</dt><dd>— / —</dd></div>
+          <div class="analytics-stat"><dt>Accuracy</dt><dd>—</dd></div>
+          <div class="analytics-stat"><dt>Brier score</dt><dd>—</dd></div>
+          <div class="analytics-stat"><dt>Walk-forward scored / target</dt><dd>— / —</dd></div>
+        </dl>
+        <div class="analytics-columns">
+          <section aria-labelledby="analytics-trend-title">
+            <h3 id="analytics-trend-title">Live archive trend</h3>
+            <p class="small">Rolling 25-record windows, every 5 records; at least 10 scored outcomes per point. Gaps mean unknown scores. These windows can be newer than the report above.</p>
+            <p id="analytics-trend-time" class="small">Live archive window-end issue times: —</p>
+            <div id="analytics-trend"><p class="small">Awaiting archive trend.</p></div>
+            <details>
+              <summary>View numeric trend values</summary>
+              <div class="analytics-scroll" tabindex="0" role="region" aria-label="Numeric trend values">
+                <table class="analytics-table trend-values">
+                  <caption>Live archive windows. All times UTC.</caption>
+                  <thead><tr><th scope="col">Window-end issue time</th><th scope="col">Scored</th><th scope="col">Accuracy</th><th scope="col">Brier</th></tr></thead>
+                  <tbody id="analytics-trend-values"><tr><td colspan="4">Awaiting archive trend.</td></tr></tbody>
+                </table>
+              </div>
+            </details>
+          </section>
+          <section class="analytics-coverage" aria-labelledby="analytics-coverage-title">
+            <h3 id="analytics-coverage-title">Evidence coverage</h3>
+            <p class="small">Report-wide collection counts. Categories may overlap.</p>
+            <dl id="analytics-coverage"><div><dt>Timely forecasts</dt><dd>—</dd></div></dl>
+          </section>
+        </div>
+        <section aria-labelledby="analytics-forecasts-title">
+          <h3 id="analytics-forecasts-title">Recent archived forecasts</h3>
+          <p id="analytics-forecasts-updated" class="small" role="status">Awaiting archived forecasts.</p>
+          <p class="small">Earliest eligible forecast per ticker, up to 25 rows ordered newest first. Unknown evidence is —. Scroll the table to see all fields.</p>
+          <div class="analytics-scroll" tabindex="0" role="region" aria-label="Recent archived forecasts">
+            <table class="analytics-table">
+              <caption>Live archive records, newest first. All times UTC; probabilities are raw estimates.</caption>
+              <thead><tr><th scope="col">Ticker</th><th scope="col">Issued</th><th scope="col">Up estimate</th><th scope="col">Official result</th><th scope="col">Timing</th><th scope="col">Up midpoint</th><th scope="col">Settlement observed</th><th scope="col">Observation delay</th></tr></thead>
+              <tbody id="analytics-forecasts"><tr><td colspan="8">Awaiting archived forecasts.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+        <p id="analytics-note" class="notice">Descriptive archived evidence; not profitability proof.</p>
+      </section>
 
       <article class="card settled">
         <div class="label">Previous market settlement</div>
@@ -380,6 +482,198 @@ HTML = r"""<!doctype html>
         renderContextComparison(await response.json());
       } catch (error) {
         renderContextComparison({status: 'unavailable', reason: 'The saved comparison could not be loaded. Retry on the next refresh.'});
+      }
+    }
+    // Analytics never supplies recommendation state or infers missing evidence.
+    const analyticsNumber = value => typeof value === 'number' && Number.isFinite(value);
+    const analyticsCount = value => analyticsNumber(value) && Number.isInteger(value) && value >= 0 ? String(value) : '—';
+    const analyticsUnit = value => analyticsNumber(value) && value >= 0 && value <= 1;
+    const analyticsPercent = value => analyticsUnit(value) ? `${(value * 100).toFixed(1)}%` : '—';
+    const analyticsScore = value => analyticsUnit(value) ? value.toFixed(3) : '—';
+    const analyticsSeconds = value => analyticsNumber(value) && value >= 0 ? `${value.toFixed(1)} s` : '—';
+    function analyticsTimestamp(value) {
+      const time = typeof value === 'string' ? Date.parse(value) : analyticsNumber(value) ? value * 1000 : NaN;
+      return Number.isFinite(time) && Number.isFinite(new Date(time).getTime()) ? time : null;
+    }
+    function analyticsDate(value) {
+      const time = analyticsTimestamp(value);
+      return time === null ? '—' : `${new Date(time).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+    }
+    function analyticsNode(tag, text, className) {
+      const node = document.createElement(tag);
+      if (text != null) node.textContent = text;
+      if (className) node.className = className;
+      return node;
+    }
+    function analyticsEmptyRow(target, columns, message) {
+      const row = analyticsNode('tr');
+      const cell = analyticsNode('td', message); cell.setAttribute('colspan', columns);
+      row.append(cell); target.replaceChildren(row);
+    }
+    function analyticsPlot(points, key, label, format) {
+      const holder = analyticsNode('div', null, `analytics-plot${key === 'brier_score' ? ' brier' : ''}`);
+      holder.append(analyticsNode('h4', label));
+      function svgNode(tag, attributes = {}, text) {
+        const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, value);
+        if (text != null) node.textContent = text;
+        return node;
+      }
+      const titleId = `analytics-${key}-title`, descId = `analytics-${key}-description`;
+      const svg = svgNode('svg', {viewBox:'0 0 560 140', role:'img', 'aria-labelledby':titleId, 'aria-describedby':descId});
+      svg.append(svgNode('title', {id:titleId}, label), svgNode('desc', {id:descId},
+        'Live archive rolling windows, ordered by window-end issue time. Missing values break the line. Exact times, scores and sample counts are in View numeric trend values.'));
+      for (const value of [0, .5, 1]) {
+        const y = 110 - value * 96;
+        svg.append(svgNode('line', {x1:80, y1:y, x2:548, y2:y, class:'plot-grid'}),
+          svgNode('text', {x:72, y:y + 4, 'text-anchor':'end'}, key === 'accuracy' ? `${value * 100}%` : value.toFixed(1)));
+      }
+      const times = points.map(point => analyticsTimestamp(point?.issued_at)).filter(time => time !== null);
+      const first = Math.min(...times), last = Math.max(...times);
+      let segment = [];
+      function flushSegment() {
+        if (segment.length > 1) svg.append(svgNode('polyline', {points:segment.join(' '), class:'plot-series'}));
+        segment = [];
+      }
+      let plotted = 0;
+      for (const point of points) {
+        const time = analyticsTimestamp(point?.issued_at), value = point?.[key];
+        if (time === null || !analyticsUnit(value)) { flushSegment(); continue; }
+        const x = first === last ? 314 : 80 + (time - first) / (last - first) * 468;
+        const y = 110 - value * 96;
+        segment.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+        const dot = svgNode('circle', {cx:x, cy:y, r:3});
+        dot.append(svgNode('title', {}, `${analyticsDate(point.issued_at)}: ${format(value)}; ${analyticsCount(point.count)} scored`));
+        svg.append(dot); plotted++;
+      }
+      flushSegment();
+      svg.append(svgNode('text', {x:80, y:134}, 'Earlier'), svgNode('text', {x:548, y:134, 'text-anchor':'end'}, 'Later'));
+      holder.append(svg);
+      if (!plotted) holder.append(analyticsNode('p', 'No scored trend values available yet.', 'small'));
+      return holder;
+    }
+    function renderAnalyticsTrend(trend) {
+      const points = Array.isArray(trend) ? trend.slice(-25) : [];
+      const target = $('analytics-trend'), values = $('analytics-trend-values');
+      target.replaceChildren(); values.replaceChildren();
+      const times = points.map(point => analyticsTimestamp(point?.issued_at)).filter(time => time !== null);
+      set('analytics-trend-time', times.length
+        ? `Live archive window-end issue times: ${analyticsDate(Math.min(...times) / 1000)} to ${analyticsDate(Math.max(...times) / 1000)}`
+        : 'Live archive window-end issue times: —');
+      if (!points.length) {
+        target.append(analyticsNode('p', 'No rolling windows available. Collecting archived evidence.', 'small'));
+        analyticsEmptyRow(values, 4, 'No rolling windows available.');
+        return;
+      }
+      target.append(analyticsPlot(points, 'accuracy', 'Accuracy (%) · higher is better', analyticsPercent),
+        analyticsPlot(points, 'brier_score', 'Brier score (0–1) · lower is better', analyticsScore));
+      for (const point of points) {
+        const row = analyticsNode('tr'), time = analyticsNode('th', analyticsDate(point?.issued_at));
+        time.setAttribute('scope', 'row'); row.append(time);
+        for (const value of [analyticsCount(point?.count), analyticsPercent(point?.accuracy), analyticsScore(point?.brier_score)]) {
+          row.append(analyticsNode('td', value));
+        }
+        values.append(row);
+      }
+    }
+    function renderAnalytics(report) {
+      const available = report?.status === 'available';
+      const pending = report?.status === 'pending';
+      const stale = available && (report.report_freshness === 'stale' || report.freshness?.status === 'stale');
+      const summary = available ? report.summary || {} : {};
+      const walk = available ? report.walk_forward || {} : {};
+      const coverage = available ? report.coverage || {} : {};
+      set('analytics-status', stale ? 'Report stale' : available
+        ? summary.eligible_count === 0 ? 'Report empty · no eligible forecasts' : 'Report available'
+        : pending ? 'Report pending' : 'Report unavailable');
+      $('analytics-status').className = `pill${stale ? ' analytics-status-stale' : ''}`;
+      $('analytics-warning').hidden = !stale;
+      set('analytics-warning', stale ? 'Stale report — diagnostic-only. These saved statistics cannot establish validation readiness or authorize an entry.' : '');
+      set('analytics-message', available
+        ? 'Summary and coverage are report-wide statistics. Analytics do not establish validation readiness.'
+        : typeof report?.reason === 'string' ? report.reason : pending
+          ? 'Awaiting the first saved evaluation report.' : 'Historical analytics are unavailable. Retry on the next refresh.');
+      const age = available && analyticsNumber(report.report_age_seconds) && report.report_age_seconds >= 0
+        ? report.report_age_seconds < 3600 ? `${Math.floor(report.report_age_seconds / 60)} min`
+          : `${(report.report_age_seconds / 3600).toFixed(1)} h` : '—';
+      set('analytics-updated', `Report updated ${available ? analyticsDate(report.generated_at) : '—'}; age at refresh ${age}`);
+      const interval = summary.accuracy_wilson_95;
+      const intervalText = analyticsUnit(interval?.lower) && analyticsUnit(interval?.upper) && interval.lower <= interval.upper
+        ? `${analyticsPercent(interval.lower)}–${analyticsPercent(interval.upper)}` : '—';
+      // The current API does not project forward scored_count. Do not substitute
+      // eligible_count, walk-forward counts, or the newest rolling sample count.
+      const stats = [
+        ['Eligible / sample threshold', `${analyticsCount(summary.eligible_count)} / ${analyticsCount(summary.minimum_count)}`, 'Eligible forecasts; threshold applies to scored evidence.'],
+        ['Accuracy', analyticsPercent(summary.accuracy), `95% Wilson interval ${intervalText}. Scored count: ${analyticsCount(summary.scored_count)} (report).`],
+        ['Brier score', analyticsScore(summary.brier_score), `Constant 50% baseline: ${analyticsScore(summary.constant_50_brier)}. Lower is better.`],
+        ['Walk-forward scored / target', `${analyticsCount(walk.scored_count)} / ${analyticsCount(walk.test_target)}`, `${analyticsCount(walk.additional_scored_samples_needed)} more scored outcomes needed.`],
+      ];
+      $('analytics-summary').replaceChildren();
+      for (const [label, value, detail] of stats) {
+        const item = analyticsNode('div', null, 'analytics-stat'), data = analyticsNode('dd', value);
+        data.append(analyticsNode('span', detail, 'small'));
+        item.append(analyticsNode('dt', label), data); $('analytics-summary').append(item);
+      }
+      $('analytics-coverage').replaceChildren();
+      const coverageRows = [
+        ['Timely forecasts', analyticsCount(coverage.timely)], ['Late forecasts excluded', analyticsCount(coverage.late)],
+        ['Missing ticker', analyticsCount(coverage.missing_ticker)], ['Missing features', analyticsCount(coverage.missing_features)],
+        ['Missing fresh quotes', analyticsCount(coverage.missing_fresh_quotes)], ['Interval gaps', analyticsCount(coverage.interval_gaps)],
+        ['Settlement delay · median', analyticsSeconds(coverage.settlement_delay_seconds?.median)],
+        ['Settlement delay · 95th percentile', analyticsSeconds(coverage.settlement_delay_seconds?.p95)],
+        ['Settlement delay · maximum', analyticsSeconds(coverage.settlement_delay_seconds?.max)],
+      ];
+      for (const [label, value] of coverageRows) {
+        const row = analyticsNode('div'); row.append(analyticsNode('dt', label), analyticsNode('dd', value));
+        $('analytics-coverage').append(row);
+      }
+      // A pending/unavailable saved report can still carry a newly read archive trend.
+      renderAnalyticsTrend(report?.trend);
+    }
+    function renderAnalyticsForecasts(payload) {
+      const target = $('analytics-forecasts'); target.replaceChildren();
+      const available = payload?.status === 'available' && Array.isArray(payload.rows);
+      const rows = available ? payload.rows.slice(0, 25) : [];
+      const message = !available ? payload?.status === 'pending' ? 'Awaiting the first archived forecasts.'
+        : 'Archived forecasts unavailable. Retry on the next refresh.' : !rows.length ? 'No eligible archived forecasts yet.'
+          : `${rows.length} archived forecasts shown.`;
+      set('analytics-forecasts-updated', `${message}${available ? ` Archive read ${analyticsDate(Date.now() / 1000)}.` : ''}`);
+      if (!rows.length) { analyticsEmptyRow(target, 8, message); return; }
+      for (const forecast of rows) {
+        const row = analyticsNode('tr');
+        const ticker = analyticsNode('th', typeof forecast?.market_ticker === 'string' && forecast.market_ticker ? forecast.market_ticker : '—');
+        ticker.setAttribute('scope', 'row'); row.append(ticker);
+        const values = [analyticsDate(forecast?.issued_at), analyticsPercent(forecast?.probability_up),
+          forecast?.result === 'yes' ? 'Yes / up' : forecast?.result === 'no' ? 'No / down' : '—',
+          forecast?.timing_status === 'timely' ? 'Timely' : forecast?.timing_status === 'late' ? 'Late' : '—',
+          analyticsPercent(forecast?.yes_mid), analyticsDate(forecast?.settlement_available_at), analyticsSeconds(forecast?.settlement_delay_seconds)];
+        values.forEach((value, index) => row.append(analyticsNode('td', value, index === 0 || index === 5 ? 'analytics-time' : '')));
+        target.append(row);
+      }
+    }
+    let analyticsInFlight = false;
+    async function refreshAnalytics() {
+      if (analyticsInFlight) return;
+      analyticsInFlight = true;
+      async function load(url, renderer) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        try {
+          const response = await fetch(url, {cache:'no-store', signal:controller.signal});
+          if (!response.ok) throw new Error('Analytics endpoint unavailable');
+          renderer(await response.json());
+        } catch (error) {
+          renderer({status:'unavailable'});
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+      try {
+        const stamp = Date.now();
+        await Promise.all([load(`/api/analytics?ts=${stamp}`, renderAnalytics),
+          load(`/api/analytics/forecasts?limit=25&ts=${stamp}`, renderAnalyticsForecasts)]);
+      } finally {
+        analyticsInFlight = false;
       }
     }
     function render(payload) {
@@ -535,7 +829,8 @@ HTML = r"""<!doctype html>
         $('learning-detail').className = 'small error';
       }
     }
-    $('refresh').addEventListener('click', () => { refresh(); refreshContextComparison(); });
+    function refreshDashboard() { refresh(); refreshContextComparison(); refreshAnalytics(); }
+    $('refresh').addEventListener('click', refreshDashboard);
     $('context-all').addEventListener('click', () => { contextQuoteSubset = false; renderContextComparison(contextReport); });
     $('context-quotes').addEventListener('click', () => { contextQuoteSubset = true; renderContextComparison(contextReport); });
     function updateClock() {
@@ -549,10 +844,8 @@ HTML = r"""<!doctype html>
     }
     updateClock();
     setInterval(updateClock, 1000);
-    refresh();
-    refreshContextComparison();
-    setInterval(refresh, 30000);
-    setInterval(refreshContextComparison, 30000);
+    refreshDashboard();
+    setInterval(refreshDashboard, 30000);
   </script>
 </body>
 </html>

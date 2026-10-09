@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 import forecast_archive
-from dashboard import DashboardApp, DashboardHandler
+from dashboard import HTML, DashboardApp, DashboardHandler
 
 
 def metrics(count, brier, loss, accuracy):
@@ -46,6 +46,24 @@ def report():
 
 
 class DashboardContextTests(unittest.TestCase):
+    def test_analytics_markup_is_semantic_and_between_context_and_settlement(self):
+        self.assertIn('id="historical-analytics"', HTML)
+        section = HTML.split('id="historical-analytics"', 1)[1].split(
+            '<article class="card settled">', 1)[0]
+        self.assertLess(HTML.index('id="context-title"'), HTML.index('id="historical-analytics"'))
+        self.assertIn('aria-labelledby="analytics-title"', section)
+        self.assertIn('<h2 id="analytics-title">Historical analytics</h2>', section)
+        for hook in ("status", "summary", "trend", "coverage", "forecasts", "note"):
+            self.assertIn(f'id="analytics-{hook}"', section)
+        self.assertIn('<caption>', section)
+        self.assertIn('scope="col"', section)
+        self.assertIn('tabindex="0"', section)
+        self.assertIn('role="status"', section)
+        self.assertIn('unavailable', section)
+        self.assertIn('Descriptive archived evidence; not profitability proof.', section)
+        self.assertNotIn('<button', section)
+        self.assertNotIn('TRADE NOW', section)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

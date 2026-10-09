@@ -1,5 +1,7 @@
 import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import closing
@@ -315,6 +317,23 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         self.assertEqual(result["freshness"]["status"], "fresh")
         json.dumps(result, allow_nan=False)
         self.assertTrue(all(isinstance(point["issued_at"], float) for point in result["trend"]))
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for executable dashboard renderer tests")
+    def test_dashboard_renderer_and_polling_against_archive_payloads(self):
+        from dashboard import HTML
+
+        for index in range(35):
+            self.insert_forecast(f"forecast-{index}", index, probability=.8,
+                                 result="yes" if index % 2 == 0 else "no")
+        self.write_validation_summary(self.validation_summary())
+        result = subprocess.run(
+            ["node", str(Path(__file__).with_name("test_dashboard_analytics.js"))],
+            input=json.dumps({"html": HTML, "analytics": read_historical_analytics(self.state_file),
+                              "forecasts": read_recent_forecasts(self.state_file)}),
+            text=True, capture_output=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("renderer and polling checks passed", result.stdout)
 
     def test_historical_limit_keeps_newest_points_after_full_window_calculation(self):
         # 157 rows produce 27 complete windows, with two rows after the last stride.
