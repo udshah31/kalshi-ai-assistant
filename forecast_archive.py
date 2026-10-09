@@ -12,11 +12,15 @@ import math
 import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
+ANALYTICS_LIMIT = 25
+ROLLING_WINDOW = 25
+ROLLING_STRIDE = 5
+STALE_REPORT_SECONDS = 36 * 60 * 60
 MARKET_FIELDS = {
     "ticker", "event_ticker", "title", "target", "target_price", "status",
     "open_time", "close_time", "settlement_time", "result", "settlement_value",
@@ -77,6 +81,19 @@ def archive_path(state_file: str | Path) -> Path:
     return state.with_name(state.stem + "_archive.sqlite3")
 
 
+def _analytics_limit(value: Any) -> int:
+    if type(value) is not int or not 1 <= value <= ANALYTICS_LIMIT:
+        raise ValueError("analytics limit must be an integer from 1 to 25")
+    return value
+
+
+def _connect_archive_readonly(state_file: str | Path):
+    path = archive_path(state_file)
+    if not path.is_file():
+        return None
+    return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+
+
 def _number(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -98,6 +115,384 @@ def _timestamp(value: Any) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _analytics_empty_summary() -> dict[str, Any]:
+    return {
+        "eligible_count": None, "minimum_count": None, "accuracy": None,
+        "accuracy_wilson_95": None, "brier_score": None, "constant_50_brier": None,
+    }
+
+
+def _analytics_empty_walk_forward() -> dict[str, Any]:
+    return {
+        "scored_count": None, "test_target": None,
+        "additional_scored_samples_needed": None, "status": None,
+    }
+
+
+def _analytics_empty_coverage() -> dict[str, Any]:
+    return {
+        "timely": None, "late": None, "missing_ticker": None,
+        "missing_features": None, "missing_fresh_quotes": None,
+        "interval_gaps": None, "settlement_delay_seconds": None,
+    }
+
+
+def _analytics_base(status: str, reason: str | None = None,
+                    trend: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status,
+        "generated_at": None,
+        "report_age_seconds": None,
+        "report_freshness": status,
+        "freshness": {"status": status},
+        "validation_ready": False,
+        "summary": _analytics_empty_summary(),
+        "walk_forward": _analytics_empty_walk_forward(),
+        "coverage": _analytics_empty_coverage(),
+        "trend": trend or [],
+        "note": "Descriptive archived evidence; not profitability proof.",
+    }
+    if reason:
+        result["reason"] = reason
+    return result
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _timing_from_archive(bar_timestamp: Any, issued_at: Any) -> str:
+    bar = _number(bar_timestamp)
+    issued = _number(issued_at)
+    if (bar is None or issued is None or bar < 0 or bar != int(bar)
+            or not 0 <= issued - (bar + 900) <= 120
+            or issued >= bar + 1800):
+        return "late"
+    return "timely"
+
+
+def _snapshot_timing(snapshot: dict[str, Any] | None, ticker: str,
+                     bar_timestamp: Any, issued_at: float) -> str:
+    if snapshot is None:
+        return "unknown"
+    bar = _number(bar_timestamp)
+    opened = _timestamp(snapshot.get("open_time"))
+    closed = _timestamp(snapshot.get("close_time"))
+    if (bar is None or opened != bar + 900 or closed != bar + 1800
+            or snapshot.get("ticker") != ticker):
+        return "unknown"
+    return "timely" if _timing_from_archive(bar, issued_at) == "timely" else "late"
+
+
+def _snapshot_midpoint(snapshot: dict[str, Any] | None, ticker: str,
+                       bar_timestamp: Any, issued_at: float) -> float | None:
+    if _snapshot_timing(snapshot, ticker, bar_timestamp, issued_at) != "timely":
+        return None
+    observed = _timestamp(snapshot.get("observed_at")) if snapshot else None
+    if observed is None or not 0 <= issued_at - observed <= 60:
+        return None
+    bid = _number(snapshot.get("yes_bid")) if snapshot else None
+    ask = _number(snapshot.get("yes_ask")) if snapshot else None
+    midpoint = _number(snapshot.get("yes_mid")) if snapshot else None
+    if (bid is None or ask is None or midpoint is None
+            or not 0 <= bid <= ask <= 1 or not 0 <= midpoint <= 1
+            or abs(midpoint - (bid + ask) / 2) > 1e-8):
+        return None
+    return midpoint
+
+
+def _settlement_values(row: sqlite3.Row, issued_at: float,
+                       expected_close: float, ticker: str) -> tuple[str | None, float | None, float | None]:
+    result = row["result"]
+    available = _timestamp(row["available_at"])
+    close = _timestamp(row["market_close_time"])
+    snapshot = _json_object(row["settlement_snapshot_json"])
+    if (result not in {"yes", "no"} or row["settlement_source"] != "kalshi_official"
+            or row["settlement_ticker"] != ticker or close != expected_close
+            or available is None or available < close or available <= issued_at
+            or (snapshot is not None and (
+                ("ticker" in snapshot and snapshot["ticker"] != ticker)
+                or ("open_time" in snapshot and _timestamp(snapshot["open_time"]) != expected_close - 900)
+                or ("close_time" in snapshot and _timestamp(snapshot["close_time"]) != expected_close)
+                or ("result" in snapshot and snapshot["result"] != result)))):
+        return None, None, None
+    return result, available, available - close
+
+
+def _canonical_archive_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only = ON")
+    rows = connection.execute("""
+        SELECT f.forecast_id, f.bar_timestamp, f.market_ticker,
+               f.forecast_issued_at, f.probability_up, f.market_snapshot_json,
+               s.market_ticker AS settlement_ticker, s.market_close_time,
+               s.result, s.available_at, s.outcome_source AS settlement_source,
+               s.snapshot_json AS settlement_snapshot_json
+        FROM forecasts AS f
+        LEFT JOIN settlements AS s ON s.forecast_id = f.forecast_id
+        WHERE f.outcome_source = 'kalshi_official'
+          AND f.validation_eligible = 1
+          AND f.market_ticker IS NOT NULL
+          AND f.forecast_issued_at IS NOT NULL
+        ORDER BY f.forecast_issued_at ASC, f.forecast_id ASC
+    """).fetchall()
+    selected: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+    for row in rows:
+        ticker = row["market_ticker"]
+        issued_at = _number(row["forecast_issued_at"])
+        bar_timestamp = _number(row["bar_timestamp"])
+        if (not isinstance(ticker, str) or not ticker.strip() or issued_at is None
+                or bar_timestamp is None or bar_timestamp != int(bar_timestamp)):
+            continue
+        # validation_eligible is the archive's eligibility decision. Recheck its
+        # immutable timing inputs so a malformed hand-written row cannot enter the
+        # canonical set as a late forecast.
+        if _timing_from_archive(bar_timestamp, issued_at) != "timely":
+            continue
+        if ticker in seen_tickers:
+            continue
+        seen_tickers.add(ticker)
+        snapshot = _json_object(row["market_snapshot_json"])
+        result, available, delay = _settlement_values(
+            row, issued_at, bar_timestamp + 1800, ticker)
+        probability = _number(row["probability_up"])
+        if probability is not None and not 0 <= probability <= 1:
+            probability = None
+        selected.append({
+            "forecast_id": str(row["forecast_id"]),
+            "issued_at": float(issued_at),
+            "market_ticker": ticker,
+            "probability_up": probability,
+            "result": result,
+            "timing_status": _snapshot_timing(snapshot, ticker, bar_timestamp, issued_at),
+            "yes_mid": _snapshot_midpoint(snapshot, ticker, bar_timestamp, issued_at),
+            "market_midpoint_available": False,
+            "settlement_available_at": float(available) if available is not None else None,
+            "settlement_delay_seconds": float(delay) if delay is not None else None,
+            "bar_timestamp": float(bar_timestamp),
+        })
+        selected[-1]["market_midpoint_available"] = selected[-1]["yes_mid"] is not None
+    return selected
+
+
+def _recent_result(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: row[key] for key in (
+        "forecast_id", "issued_at", "market_ticker", "probability_up", "result",
+        "timing_status", "yes_mid", "market_midpoint_available",
+        "settlement_available_at", "settlement_delay_seconds")}
+
+
+def read_recent_forecasts(state_file: str | Path, limit: int = 25) -> dict[str, Any]:
+    """Read a bounded table of frozen official forecasts without creating evidence."""
+    _analytics_limit(limit)
+    connection = _connect_archive_readonly(state_file)
+    if connection is None:
+        return {"status": "pending", "reason": "Awaiting the first archived forecasts.", "rows": []}
+    try:
+        with closing(connection):
+            records = _canonical_archive_rows(connection)
+        records.sort(key=lambda row: (row["issued_at"], row["forecast_id"]), reverse=True)
+        return {"status": "available", "rows": [_recent_result(row) for row in records[:limit]]}
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return {"status": "unavailable", "reason": "Archived forecasts are unavailable.", "rows": []}
+
+
+def _metric_values(metrics: Any, scored_count: int) -> dict[str, Any]:
+    if not isinstance(metrics, dict) or type(metrics.get("count")) is not int:
+        raise ValueError("invalid metric count")
+    if metrics["count"] != scored_count or metrics["count"] < 0:
+        raise ValueError("contradictory metric count")
+    result: dict[str, Any] = {}
+    for key in ("accuracy", "brier_score"):
+        value = metrics.get(key)
+        number = _number(value)
+        if scored_count and (number is None or not 0 <= number <= 1):
+            raise ValueError("invalid metric value")
+        if not scored_count and value is not None:
+            raise ValueError("invalid empty metric value")
+        result[key] = number
+    interval = metrics.get("accuracy_wilson_95")
+    if interval is not None:
+        if not isinstance(interval, dict):
+            raise ValueError("invalid accuracy interval")
+        lower, upper = _number(interval.get("lower")), _number(interval.get("upper"))
+        if (lower is None or upper is None or not 0 <= lower <= upper <= 1):
+            raise ValueError("invalid accuracy interval")
+        result["accuracy_wilson_95"] = {"lower": lower, "upper": upper}
+    else:
+        result["accuracy_wilson_95"] = None
+    return result
+
+
+def _report_projection(report: dict[str, Any]) -> dict[str, Any]:
+    if (report.get("schema_version") != 1
+            or report.get("status") not in {"descriptive_evaluation", "insufficient_data", "missing_evidence"}
+            or report.get("calibration_applied_live") is not False):
+        raise ValueError("invalid validation report")
+    data_quality = report.get("data_quality")
+    forward = report.get("forward")
+    walk = report.get("walk_forward")
+    if not isinstance(data_quality, dict) or not isinstance(forward, dict) or not isinstance(walk, dict):
+        raise ValueError("incomplete validation report")
+    eligible = forward.get("eligible_forecasts")
+    scored = forward.get("scored_count")
+    unscored = forward.get("unscored_count")
+    minimum = forward.get("minimum_evidence_samples")
+    additional = forward.get("additional_scored_samples_needed")
+    if any(type(value) is not int or value < 0 for value in (eligible, scored, unscored)):
+        raise ValueError("invalid forward counts")
+    if type(minimum) is not int or minimum < 1 or type(additional) is not int or additional < 0:
+        raise ValueError("invalid evidence target")
+    if (scored > eligible or unscored != eligible - scored
+            or additional != max(0, minimum - scored)):
+        raise ValueError("contradictory forward counts")
+    metrics = _metric_values(forward.get("metrics"), scored)
+    baselines = forward.get("baselines")
+    if not isinstance(baselines, dict):
+        raise ValueError("missing validation baselines")
+    constant = baselines.get("constant_50_percent")
+    if not isinstance(constant, dict) or type(constant.get("count")) is not int or constant["count"] != scored:
+        raise ValueError("contradictory baseline count")
+    constant_brier = _number(constant.get("brier_score"))
+    if scored and (constant_brier is None or not 0 <= constant_brier <= 1):
+        raise ValueError("invalid baseline metric")
+    if not scored and constant.get("brier_score") is not None:
+        raise ValueError("invalid empty baseline metric")
+
+    walk_scored = walk.get("scored_count")
+    walk_tested = walk.get("test_count")
+    walk_minimum = walk.get("minimum_evidence_samples")
+    walk_additional = walk.get("additional_scored_samples_needed")
+    if (any(type(value) is not int or value < 0 for value in (walk_scored, walk_tested))
+            or type(walk_minimum) is not int or walk_minimum < 1
+            or type(walk_additional) is not int or walk_additional < 0
+            or walk_scored > walk_tested
+            or walk_additional != max(0, walk_minimum - walk_scored)
+            or walk.get("status") not in {"descriptive_evaluation", "insufficient_data"}):
+        raise ValueError("contradictory walk-forward counts")
+
+    collection = data_quality.get("collection_quality")
+    if not isinstance(collection, dict):
+        raise ValueError("missing collection quality")
+    coverage_keys = (
+        "timely_forecast_rows", "excluded_late_forecasts", "excluded_missing_ticker",
+        "missing_feature_vectors", "missing_fresh_market_snapshots", "interval_gap_count")
+    if any(type(collection.get(key)) is not int or collection[key] < 0 for key in coverage_keys):
+        raise ValueError("invalid collection counts")
+    delays = collection.get("settlement_delay_seconds")
+    if not isinstance(delays, dict):
+        raise ValueError("missing settlement delays")
+    delay_values: dict[str, float | None] = {}
+    for key in ("median", "p95", "max"):
+        value = delays.get(key)
+        number = _number(value)
+        if value is not None and (number is None or number < 0):
+            raise ValueError("invalid settlement delay")
+        delay_values[key] = number
+    present_delays = [value for value in delay_values.values() if value is not None]
+    if present_delays and present_delays != sorted(present_delays):
+        raise ValueError("contradictory settlement delays")
+    return {
+        "generated_at": report["generated_at"],
+        "summary": {
+            "eligible_count": eligible, "minimum_count": minimum,
+            **metrics, "constant_50_brier": constant_brier,
+        },
+        "walk_forward": {
+            "scored_count": walk_scored, "test_target": walk_minimum,
+            "additional_scored_samples_needed": walk_additional,
+            "status": walk["status"],
+        },
+        "coverage": {
+            "timely": collection["timely_forecast_rows"],
+            "late": collection["excluded_late_forecasts"],
+            "missing_ticker": collection["excluded_missing_ticker"],
+            "missing_features": collection["missing_feature_vectors"],
+            "missing_fresh_quotes": collection["missing_fresh_market_snapshots"],
+            "interval_gaps": collection["interval_gap_count"],
+            "settlement_delay_seconds": delay_values,
+        },
+    }
+
+
+def _rolling_trend(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trend: list[dict[str, Any]] = []
+    for end in range(ROLLING_WINDOW - 1, len(records), ROLLING_STRIDE):
+        window = records[end - ROLLING_WINDOW + 1:end + 1]
+        scored = [row for row in window if row["result"] in {"yes", "no"}
+                  and row["probability_up"] is not None]
+        point: dict[str, Any] = {"issued_at": float(window[-1]["issued_at"]), "count": len(scored)}
+        if len(scored) >= 10:
+            labels = [int(row["result"] == "yes") for row in scored]
+            probabilities = [row["probability_up"] for row in scored]
+            point["accuracy"] = sum((probability >= .5) == bool(label)
+                                     for probability, label in zip(probabilities, labels)) / len(labels)
+            point["brier_score"] = sum((probability - label) ** 2
+                                        for probability, label in zip(probabilities, labels)) / len(labels)
+        trend.append(point)
+    return trend
+
+
+def _analytics_with_report(records: list[dict[str, Any]], report: dict[str, Any],
+                           trend: list[dict[str, Any]]) -> dict[str, Any]:
+    projection = _report_projection(report)
+    generated_at = _timestamp(projection["generated_at"])
+    now = time.time()
+    if generated_at is None or not math.isfinite(generated_at) or generated_at > now:
+        raise ValueError("invalid validation report timestamp")
+    age = now - generated_at
+    stale = age > STALE_REPORT_SECONDS
+    result = _analytics_base("available", trend=trend)
+    result.update({
+        "generated_at": projection["generated_at"],
+        "report_age_seconds": float(age),
+        "report_freshness": "stale" if stale else "fresh",
+        "freshness": {"status": "stale" if stale else "fresh",
+                       "diagnostic_only": stale},
+        "validation_ready": False,
+        "summary": projection["summary"],
+        "walk_forward": projection["walk_forward"],
+        "coverage": projection["coverage"],
+    })
+    if stale:
+        result["reason"] = "Validation report is stale; metrics are diagnostic-only."
+    return result
+
+
+def read_historical_analytics(state_file: str | Path, limit: int = 25) -> dict[str, Any]:
+    """Read descriptive archive evidence independently of live prediction state."""
+    _analytics_limit(limit)
+    connection = _connect_archive_readonly(state_file)
+    if connection is None:
+        return _analytics_base("pending", "Awaiting the first archived forecasts.")
+    trend: list[dict[str, Any]] = []
+    try:
+        with closing(connection):
+            records = _canonical_archive_rows(connection)
+        trend = _rolling_trend(records)
+        report = read_validation_summary(state_file)
+        if report.get("status") in {"pending", "unavailable"}:
+            return _analytics_base(report["status"], report.get("reason"), trend)
+        return _analytics_with_report(records, report, trend)
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return _analytics_base("unavailable", "Historical analytics are unavailable.", trend)
 
 
 def _clean(value: Any) -> Any:
