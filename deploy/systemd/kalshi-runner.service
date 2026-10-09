@@ -1,0 +1,26 @@
+[Unit]
+Description=BTC 15-minute continuous paper collector
+Wants=network-online.target kalshi-dashboard.service
+After=network-online.target kalshi-dashboard.service
+ConditionPathExists=/var/lib/kalshi/btc_15m_state.json
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+User=kalshi
+Group=kalshi
+WorkingDirectory=/opt/kalshi
+EnvironmentFile=/etc/kalshi/kalshi.env
+ExecStart=/usr/bin/python3 -u /opt/kalshi/live_runner.py --forever --poll-seconds 30 --dashboard-url http://127.0.0.1:8765 --lookback-minutes 1440 --state-file /var/lib/kalshi/btc_15m_state.json --log-file /var/lib/kalshi/live_session.jsonl --kalshi-series KXBTC15M
+Restart=always
+RestartSec=5
+TimeoutStopSec=130
+StateDirectory=kalshi
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile Python modules
+        run: python -m compileall -q *.py tests
+
+      - name: Check shell syntax
+        run: bash -n deploy/*.sh
+
+      - name: Build code-only bundle
+        run: bash deploy/package.sh
+
+      - name: Inspect bundle contents
+        run: |
+          python - <<'PY'
+          import tarfile
+
+          with tarfile.open("dist/kalshi-ubuntu.tgz", "r:gz") as archive:
+              names = archive.getnames()
+
+          forbidden = ("data/", ".pem", ".key", "btc_15m_state.json", "btc_15m_state_archive.sqlite3")
+          bad = [
+              name for name in names
+              if any(token in name for token in forbidden)
+              or name.endswith(".env")
+          ]
+          if bad:
+              raise SystemExit(f"forbidden files in code bundle: {bad}")
+
+          required = {
+              "btc_predictor.py",
+              "backup_state.py",
+              "deploy/install.sh",
+              "deploy/oracle-deploy.sh",
+              "deploy/oracle-rollback.sh",
+          }
+          missing = sorted(required - set(names))
+          if missing:
+              raise SystemExit(f"missing required bundle files: {missing}")
+          print(f"verified {len(names)} bundle entries")
+          PY
+
+      - name: Upload code bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-ubuntu-${{ matrix.python-version }}
+          path: dist/kalshi-ubuntu.tgz
+          retention-days: 1

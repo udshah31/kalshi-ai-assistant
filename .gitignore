@@ -1,0 +1,26 @@
+# Runtime state, market evidence, reports, locks, and local backups
+data/
+__agent__/
+*.sqlite3
+*.sqlite3-*
+*.json.lock
+*.jsonl
+*.backup.lock
+
+# Generated release artifacts and Python bytecode
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local secrets and deployment credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# macOS metadata and local logs
+.DS_Store
+*.log

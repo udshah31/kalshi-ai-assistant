@@ -1,0 +1,149 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Git branch, tag, or commit to deploy
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kalshi-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile Python modules
+        run: python -m compileall -q *.py tests
+
+      - name: Check shell syntax
+        run: bash -n deploy/*.sh
+
+      - name: Build code-only bundle
+        run: bash deploy/package.sh
+
+      - name: Record deployed commit
+        run: git rev-parse HEAD > dist/release-id
+
+      - name: Inspect bundle contents
+        run: |
+          python - <<'PY'
+          import tarfile
+
+          with tarfile.open("dist/kalshi-ubuntu.tgz", "r:gz") as archive:
+              names = archive.getnames()
+
+          forbidden = ("data/", ".pem", ".key", "btc_15m_state.json", "btc_15m_state_archive.sqlite3")
+          bad = [
+              name for name in names
+              if any(token in name for token in forbidden)
+              or name.endswith(".env")
+          ]
+          if bad:
+              raise SystemExit(f"forbidden files in code bundle: {bad}")
+
+          required = {
+              "btc_predictor.py",
+              "backup_state.py",
+              "deploy/install.sh",
+              "deploy/oracle-deploy.sh",
+              "deploy/oracle-rollback.sh",
+          }
+          missing = sorted(required - set(names))
+          if missing:
+              raise SystemExit(f"missing required bundle files: {missing}")
+          print(f"verified {len(names)} bundle entries")
+          PY
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalshi-release
+          path: |
+            dist/kalshi-ubuntu.tgz
+            dist/release-id
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kalshi-release
+          path: dist
+
+      - name: Configure strict SSH
+        env:
+          ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+          ORACLE_KNOWN_HOSTS: ${{ secrets.ORACLE_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$ORACLE_SSH_PRIVATE_KEY"
+          test -n "$ORACLE_KNOWN_HOSTS"
+          printf '%s\n' "$ORACLE_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/oracle_key"
+          printf '%s\n' "$ORACLE_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+          chmod 600 "$RUNNER_TEMP/oracle_key" "$RUNNER_TEMP/known_hosts"
+
+      - name: Deploy code and verify production
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$ORACLE_HOST"
+          test -n "$ORACLE_USER"
+
+          local_bundle="$RUNNER_TEMP/kalshi-ubuntu.tgz"
+          local_helper="$RUNNER_TEMP/oracle-deploy.sh"
+          cp dist/kalshi-ubuntu.tgz "$local_bundle"
+          tar -xOf "$local_bundle" deploy/oracle-deploy.sh > "$local_helper"
+          chmod 700 "$local_helper"
+
+          ssh_options=(
+            -i "$RUNNER_TEMP/oracle_key"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o GlobalKnownHostsFile=/dev/null
+            -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts"
+          )
+          target="$ORACLE_USER@$ORACLE_HOST"
+          release_id="$(cat dist/release-id)"
+          remote_bundle="/tmp/kalshi-ubuntu-${release_id}.tgz"
+          remote_helper="/tmp/oracle-deploy-${release_id}.sh"
+
+          scp "${ssh_options[@]}" "$local_bundle" "$target:$remote_bundle"
+          scp "${ssh_options[@]}" "$local_helper" "$target:$remote_helper"
+
+          set +e
+          ssh "${ssh_options[@]}" "$target" \
+            "sudo bash '$remote_helper' '$remote_bundle' '$release_id'"
+          deploy_status=$?
+          set -e
+
+          ssh "${ssh_options[@]}" "$target" \
+            "sudo journalctl -u kalshi-runner.service -u kalshi-dashboard.service -n 40 --no-pager" || true
+          ssh "${ssh_options[@]}" "$target" \
+            "sudo rm -f '$remote_helper' '$remote_bundle'" || true
+          exit "$deploy_status"

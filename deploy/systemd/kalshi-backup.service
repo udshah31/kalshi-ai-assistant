@@ -1,0 +1,19 @@
+[Unit]
+Description=Verified BTC predictor state and SQLite backup
+ConditionPathExists=/var/lib/kalshi/btc_15m_state.json
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+Type=oneshot
+User=kalshi
+Group=kalshi
+WorkingDirectory=/opt/kalshi
+ExecStart=/usr/bin/python3 /opt/kalshi/backup_state.py create --state-file /var/lib/kalshi/btc_15m_state.json --backup-dir /var/lib/kalshi/backups --keep 7
+TimeoutStartSec=300
+StateDirectory=kalshi
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

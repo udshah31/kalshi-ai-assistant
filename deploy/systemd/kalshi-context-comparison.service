@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only BTC context-horizon comparison
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+Type=oneshot
+User=kalshi
+Group=kalshi
+WorkingDirectory=/opt/kalshi
+ExecStart=/usr/bin/python3 /opt/kalshi/validation.py compare-context --archive-file /var/lib/kalshi/btc_15m_state_archive.sqlite3 --output-json /var/lib/kalshi/btc_15m_context_comparison.json --train-size 100 --test-size 25 --epochs 5
+TimeoutStartSec=120
+StateDirectory=kalshi
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StandardOutput=null
+StandardError=journal

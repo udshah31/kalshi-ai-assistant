@@ -1,0 +1,25 @@
+[Unit]
+Description=BTC 15-minute paper dashboard
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/kalshi/btc_15m_state.json
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+User=kalshi
+Group=kalshi
+WorkingDirectory=/opt/kalshi
+EnvironmentFile=/etc/kalshi/kalshi.env
+ExecStart=/usr/bin/python3 -u /opt/kalshi/dashboard.py --host 127.0.0.1 --port 8765 --lookback-minutes 1440 --state-file /var/lib/kalshi/btc_15m_state.json
+Restart=always
+RestartSec=5
+StateDirectory=kalshi
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

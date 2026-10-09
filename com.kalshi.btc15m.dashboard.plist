@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.kalshi.btc15m.dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-u</string>
+    <string>/Volumes/Secondary/new_project/kalshi/dashboard.py</string>
+    <string>--host</string><string>127.0.0.1</string>
+    <string>--port</string><string>8765</string>
+    <string>--lookback-minutes</string><string>1440</string>
+    <string>--state-file</string><string>/Volumes/Secondary/new_project/kalshi/data/btc_15m_state.json</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Volumes/Secondary/new_project/kalshi</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/udaysah/Library/Logs/Kalshi/dashboard-service.log</string>
+  <key>StandardErrorPath</key><string>/Users/udaysah/Library/Logs/Kalshi/dashboard-service-error.log</string>
+</dict>
+</plist>

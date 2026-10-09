@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly BTC context-horizon comparison
+
+[Timer]
+OnCalendar=*-*-* *:05:00 UTC
+AccuracySec=1min
+Persistent=true
+Unit=kalshi-context-comparison.service
+
+[Install]
+WantedBy=timers.target
