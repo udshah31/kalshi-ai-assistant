@@ -247,8 +247,10 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                 connection.execute("DELETE FROM forecasts")
 
     @staticmethod
-    def validation_summary(*, generated_at=None, scored_count=35, eligible_count=35):
+    def validation_summary(*, generated_at=None, scored_count=35, eligible_count=35,
+                           walk_scored_count=None):
         generated_at = generated_at or datetime.now(timezone.utc).isoformat()
+        walk_scored_count = scored_count if walk_scored_count is None else walk_scored_count
         status = "insufficient_data" if scored_count < 100 else "descriptive_evaluation"
         metrics = {
             "count": scored_count, "accuracy": .6 if scored_count else None,
@@ -278,9 +280,10 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                 "baselines": {"constant_50_percent": constant},
             },
             "walk_forward": {
-                "status": status, "scored_count": scored_count,
-                "test_count": scored_count, "minimum_evidence_samples": 100,
-                "additional_scored_samples_needed": max(0, 100 - scored_count),
+                "status": "insufficient_data" if walk_scored_count < 100 else "descriptive_evaluation",
+                "scored_count": walk_scored_count,
+                "test_count": walk_scored_count, "minimum_evidence_samples": 100,
+                "additional_scored_samples_needed": max(0, 100 - walk_scored_count),
             },
         }
 
@@ -292,7 +295,8 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         for index in range(35):
             self.insert_forecast(f"forecast-{index}", index, probability=.8,
                                  result="yes" if index % 2 == 0 else "no")
-        self.write_validation_summary(self.validation_summary())
+        self.write_validation_summary(self.validation_summary(
+            scored_count=30, eligible_count=35, walk_scored_count=12))
         result = read_historical_analytics(self.state_file)
         self.assertEqual(result["status"], "available")
         self.assertEqual([point["issued_at"] for point in result["trend"]],
@@ -303,9 +307,10 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                                     (.328, .352, .328)):
             self.assertAlmostEqual(actual, expected)
         self.assertEqual(result["summary"]["eligible_count"], 35)
+        self.assertEqual(result["summary"].get("scored_count"), 30)
         self.assertEqual(result["summary"]["minimum_count"], 100)
         self.assertEqual(result["summary"]["constant_50_brier"], .25)
-        self.assertEqual(result["walk_forward"]["scored_count"], 35)
+        self.assertEqual(result["walk_forward"]["scored_count"], 12)
         self.assertEqual(result["walk_forward"]["test_target"], 100)
         self.assertEqual(result["coverage"], {
             "timely": 30, "late": 5, "missing_ticker": 2,
@@ -325,7 +330,8 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         for index in range(35):
             self.insert_forecast(f"forecast-{index}", index, probability=.8,
                                  result="yes" if index % 2 == 0 else "no")
-        self.write_validation_summary(self.validation_summary())
+        self.write_validation_summary(self.validation_summary(
+            scored_count=30, eligible_count=35, walk_scored_count=12))
         result = subprocess.run(
             ["node", str(Path(__file__).with_name("test_dashboard_analytics.js"))],
             input=json.dumps({"html": HTML, "analytics": read_historical_analytics(self.state_file),
@@ -369,6 +375,8 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         self.insert_forecast("forecast-0", result="yes")
         result = read_historical_analytics(self.state_file)
         self.assertEqual(result["status"], "pending")
+        self.assertIn("scored_count", result["summary"])
+        self.assertIsNone(result["summary"]["scored_count"])
         self.assertIsNone(result["summary"]["accuracy"])
         self.assertIsNone(result["coverage"]["timely"])
         self.assertFalse(result["validation_ready"])
@@ -386,6 +394,7 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         self.assertGreater(result["report_age_seconds"], forecast_archive.STALE_REPORT_SECONDS)
         self.assertFalse(result["validation_ready"])
         self.assertEqual(result["summary"]["eligible_count"], 1)
+        self.assertEqual(result["summary"].get("scored_count"), 1)
 
     def test_malformed_or_contradictory_validation_report_is_unavailable(self):
         self.insert_forecast("forecast-0", result="yes")
@@ -394,6 +403,8 @@ class HistoricalAnalyticsTests(unittest.TestCase):
         self.write_validation_summary(invalid)
         result = read_historical_analytics(self.state_file)
         self.assertEqual(result["status"], "unavailable")
+        self.assertIn("scored_count", result["summary"])
+        self.assertIsNone(result["summary"]["scored_count"])
         self.assertFalse(result["validation_ready"])
         self.assertIsNone(result["summary"]["accuracy"])
         invalid["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -446,6 +457,7 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                 self.write_validation_summary(report)
                 result = read_historical_analytics(self.state_file)
                 self.assertEqual(result["status"], "available")
+                self.assertEqual(result["summary"].get("scored_count"), scored)
                 self.assertEqual(result["walk_forward"]["status"], status)
                 self.assertEqual(result["walk_forward"]["scored_count"], scored)
                 self.assertEqual(result["summary"]["constant_50_brier"], .25 if scored else None)

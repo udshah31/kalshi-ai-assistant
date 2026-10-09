@@ -600,8 +600,6 @@ HTML = r"""<!doctype html>
       const interval = summary.accuracy_wilson_95;
       const intervalText = analyticsUnit(interval?.lower) && analyticsUnit(interval?.upper) && interval.lower <= interval.upper
         ? `${analyticsPercent(interval.lower)}–${analyticsPercent(interval.upper)}` : '—';
-      // The current API does not project forward scored_count. Do not substitute
-      // eligible_count, walk-forward counts, or the newest rolling sample count.
       const stats = [
         ['Eligible / sample threshold', `${analyticsCount(summary.eligible_count)} / ${analyticsCount(summary.minimum_count)}`, 'Eligible forecasts; threshold applies to scored evidence.'],
         ['Accuracy', analyticsPercent(summary.accuracy), `95% Wilson interval ${intervalText}. Scored count: ${analyticsCount(summary.scored_count)} (report).`],

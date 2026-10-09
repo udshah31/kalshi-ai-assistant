@@ -46,6 +46,7 @@ const context = vm.createContext({document, console, Date, AbortController,
 });
 const run = source => vm.runInContext(source, context);
 const text = id => elements.get(id).textContent;
+const stat = label => elements.get('analytics-summary').children.find(item => item.children[0].textContent === label).textContent;
 const descendants = element => element.children.flatMap(child => [child, ...descendants(child)]);
 const tags = (id, tag) => descendants(elements.get(id)).filter(node => node.tagName === tag);
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -59,11 +60,13 @@ async function check(name, fn) { await fn(); checks++; console.log(`PASS ${name}
   context.fixture = input.analytics;
   context.rowsFixture = input.forecasts;
 
-  await check('actual payload summary, absent scored count, coverage and timestamp units', () => {
-    assert.match(text('analytics-summary'), /35\s*\/\s*100/);
+  await check('actual forward scored count differs from eligible, walk-forward and rolling counts', () => {
+    assert.match(stat('Eligible / sample threshold'), /35\s*\/\s*100/);
     assert.match(text('analytics-summary'), /60\.0%/);
     assert.match(text('analytics-summary'), /40\.0%.*75\.0%/);
-    assert.match(text('analytics-summary'), /Scored.*—/);
+    assert.match(stat('Accuracy'), /Scored count: 30 \(report\)/);
+    assert.match(stat('Walk-forward scored / target'), /12\s*\/\s*100/);
+    assert.ok(tags('analytics-trend-values', 'tr').every(row => row.children[1].textContent === '25'));
     assert.match(text('analytics-summary'), /0\.200/);
     assert.match(text('analytics-summary'), /0\.250/);
     assert.match(text('analytics-coverage'), /30/);
@@ -81,12 +84,23 @@ async function check(name, fn) { await fn(); checks++; console.log(`PASS ${name}
     assert.match(text('analytics-trend-values'), /0\.328/);
     assert.equal(tags('analytics-forecasts', 'tr').length, 25);
   });
+  await check('forward scored count preserves absent, null and zero values', () => {
+    for (const [value, expected] of [[undefined, '—'], [null, '—'], [0, '0']]) {
+      context.summary = {...input.analytics.summary, scored_count:value};
+      if (value === undefined) delete context.summary.scored_count;
+      run('renderAnalytics({...fixture, summary})');
+      assert.ok(stat('Accuracy').includes(`Scored count: ${expected} (report)`));
+      assert.match(stat('Eligible / sample threshold'), /35\s*\/\s*100/);
+      assert.match(stat('Walk-forward scored / target'), /12\s*\/\s*100/);
+    }
+  });
   await check('stale available report is diagnostic-only with retained report values', () => {
     run("renderAnalytics({...fixture, report_freshness:'stale', freshness:{status:'stale'}, validation_ready:false})");
     assert.match(text('analytics-status'), /stale/i);
     assert.equal(elements.get('analytics-warning').hidden, false);
     assert.match(text('analytics-warning'), /diagnostic.only/i);
     assert.match(text('analytics-summary'), /60\.0%/);
+    assert.match(stat('Accuracy'), /Scored count: 30 \(report\)/);
     assert.doesNotMatch(text('analytics-status'), /ready|validated/i);
     run("renderAnalytics({...fixture, report_freshness:'fresh', freshness:{status:'stale'}})");
     assert.match(text('analytics-status'), /stale/i);
@@ -96,6 +110,7 @@ async function check(name, fn) { await fn(); checks++; console.log(`PASS ${name}
       context.state = state;
       run('renderAnalytics(state ? {status:state, reason:"Fixture reason"} : null)');
       assert.doesNotMatch(text('analytics-summary'), /60\.0%|0\.200/);
+      assert.match(stat('Accuracy'), /Scored count: — \(report\)/);
       assert.equal(tags('analytics-trend', 'circle').length, 0);
       assert.match(text('analytics-status'), state === 'pending' ? /pending|awaiting/i : /unavailable/i);
       assert.equal(elements.get('analytics-warning').hidden, true);

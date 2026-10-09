@@ -119,7 +119,7 @@ def _timestamp(value: Any) -> float | None:
 
 def _analytics_empty_summary() -> dict[str, Any]:
     return {
-        "eligible_count": None, "minimum_count": None, "accuracy": None,
+        "eligible_count": None, "scored_count": None, "minimum_count": None, "accuracy": None,
         "accuracy_wilson_95": None, "brier_score": None, "constant_50_brier": None,
     }
 
@@ -432,7 +432,7 @@ def _report_projection(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "generated_at": report["generated_at"],
         "summary": {
-            "eligible_count": eligible, "minimum_count": minimum,
+            "eligible_count": eligible, "scored_count": scored, "minimum_count": minimum,
             **metrics, "constant_50_brier": constant_brier,
         },
         "walk_forward": {
