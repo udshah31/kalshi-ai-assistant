@@ -28,14 +28,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Require Node for renderer tests
+        run: node --version
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
       - name: Compile Python modules
-        run: python -m compileall -q *.py tests
+        run: python -m compileall -q ./*.py tests
 
       - name: Check shell syntax
-        run: bash -n deploy/*.sh
+        run: |
+          for script in deploy/*.sh; do
+            bash -n "$script" || exit 1
+          done
 
       - name: Build code-only bundle
         run: bash deploy/package.sh
@@ -137,6 +147,8 @@ jobs:
           scp "${ssh_options[@]}" "$local_helper" "$target:$remote_helper"
 
           set +e
+          # Expand these locally constructed paths/IDs before sending the remote command.
+          # shellcheck disable=SC2029
           ssh "${ssh_options[@]}" "$target" \
             "sudo bash '$remote_helper' '$remote_bundle' '$release_id'"
           deploy_status=$?
@@ -144,6 +156,8 @@ jobs:
 
           ssh "${ssh_options[@]}" "$target" \
             "sudo journalctl -u kalshi-runner.service -u kalshi-dashboard.service -n 40 --no-pager" || true
+          # Cleanup uses the same locally constructed paths, not remote shell variables.
+          # shellcheck disable=SC2029
           ssh "${ssh_options[@]}" "$target" \
             "sudo rm -f '$remote_helper' '$remote_bundle'" || true
           exit "$deploy_status"

@@ -363,16 +363,16 @@ Read the report-wide counts as different populations:
 - **Walk-forward scored / target** (`walk_forward.scored_count` /
   `walk_forward.test_target`) counts scored held-out predictions from fresh offline
   models, with enough earlier known training/calibration labels and original features.
-  Its default target is also 100, but this is a separate population from forward
-  scores, the recent table, and each rolling window.
+  Its default target is also 100. It is a subset of the canonical forward scored
+  population, distinct from the recent table and each rolling window.
 
 **Live archive trend** plots accuracy (%) and Brier score (0–1) separately. It uses
 complete **25-record rolling windows**, with **stride 5**: window ends are records
 25, 30, 35, and so on in the chronological, ticker-deduplicated eligible archive.
 Each point reports its own scored count; accuracy and Brier require at least **10
 valid official labels with usable probabilities** within that window. Below 10,
-the point retains its time/count but omits both scores. Windows are calculated
-before retaining the newest **up to 25 points**, displayed oldest to newest;
+the point retains its time/count but omits both scores. Global window alignment is
+preserved while calculating only the newest **up to 25 points**, displayed oldest to newest;
 records after the last complete stride await the next window. **View numeric trend
 values** exposes exact window-end issue times, counts, and scores. Unknown values
 are `—` and break chart lines; they are never zero-filled. Recorded zero remains zero.
@@ -387,6 +387,41 @@ report. The recent table's **Archive read** time is the browser refresh time, wh
 is settlement receipt time minus market close, not time since forecast issuance.
 Displayed timestamps are UTC.
 
+**Bounded archive reads and reuse:** both endpoints share an in-process cache of
+at most **four archive paths**, with a **10-second TTL** for successful reads and
+safe unavailable results. Each request checks the resolved database and nonempty
+WAL identity (device, inode, byte size, nanosecond modification/change times).
+Replacement, deletion, or changed evidence invalidates reuse immediately; a source
+change during a scan discards that scan. An absent and an empty WAL are equivalent
+because neither contains committed frames. SHM read marks are not evidence identity.
+Only **one analytics scan per process** can run at once; other callers wait at most
+**250 ms** for reuse, then receive unavailable. This uses a separate analytics lock
+and never acquires the live prediction/state lock. The saved report is read and
+validated on every analytics request, independently of the archive cache.
+
+A cold scan has a **1-second cooperative deadline**, **5,000,000 SQLite VM steps**
+(checked at most every 1,000 steps, including filtering/sort/join work), and a
+**100-ms SQLite busy timeout**. It accepts at most **50,000 streamed candidate rows**, tracks
+at most **25,000 distinct eligible tickers**, and permits at most **16 MiB of decoded
+field bytes** (text counted as UTF-8, scalar fields as eight bytes), with a **64-KiB
+SQLite record/value limit**. One over-limit probe row causes the whole scan to fail.
+Duplicates and rejected rows consume the row/byte budget.
+SQLite uses a 2-MiB page-cache target and file-backed temporary sorting. The Python
+scan retains only the newest **149 canonical rows**, sufficient for 25 windows of
+25 records at stride 5, including the incomplete-stride tail. Probability and
+forecast identity must be valid before a ticker is claimed; the earliest eligible
+unresolved forecast still wins over a later settled retry.
+
+Even `limit=1` verifies the complete global population within these budgets. If a
+budget is exceeded, both endpoints fail safely with **unavailable**, empty archive
+rows/trend, and cleared report metrics; they never silently truncate the population.
+Large histories beyond these caps require a future separately maintained summary
+or an explicitly reviewed budget change. The deadline is cooperative, not an OS
+hard real-time guarantee; filesystem stalls and thread scheduling can add latency.
+`archive_read_at` is the successful scan-completion Unix timestamp, possibly reused
+for up to 10 seconds. Browser **Archive read** is request time; report `generated_at`
+and the 36-hour report staleness threshold are separate freshness measures.
+
 A valid report **older than 36 hours** stays `status="available"` with
 `report_freshness="stale"` and `freshness.diagnostic_only=true`; the UI retains its
 statistics with a prominent **Stale report — diagnostic-only** warning.
@@ -399,9 +434,12 @@ the report is pending/unavailable, and the recent-forecast endpoint works
 independently. A valid empty archive returns an available, empty forecast table.
 Request failures clear the affected display rather than retaining a previous success.
 
-The endpoints read the existing SQLite archive in read-only mode and the saved
+The endpoints read the existing SQLite archive with `mode=ro` plus `query_only` and the saved
 `<state-stem>_validation_summary.json`; they perform no network collection, model
-updates, state/archive/report writes, or report generation. **Descriptive archived
+updates, application writes to state/archive/report evidence, or report generation.
+SQLite may create/update native **WAL/SHM coordination sidecars** and temporary sort
+files; read-only SQL is not a zero-filesystem-mutation guarantee. `immutable=1` is
+not used: committed, uncheckpointed WAL evidence remains visible. **Descriptive archived
 evidence; not profitability proof.** These charts measure forecast accuracy and
 probability error, not profit or paper-account returns, and never authorize paper
 entries. See [analytics operations](deploy/README.md#historical-analytics-operations)
@@ -417,7 +455,9 @@ The runtime remains dependency-free: Python's standard library plus inline brows
 JavaScript/SVG, with no pip/npm packages or chart-library build step. **Node.js is
 optional for development, but required to execute the dashboard renderer/polling
 tests** invoked by the Python suite. Put `node` on `PATH` to run them; without it,
-that integration test is explicitly skipped. Node is not needed to serve the dashboard.
+that integration test is explicitly skipped locally. Both CI and deployment-build
+workflows install/check Node 24 before the suite, so renderer coverage cannot
+silently skip there. Node is not needed to serve the dashboard.
 
 ## Important limitations
 

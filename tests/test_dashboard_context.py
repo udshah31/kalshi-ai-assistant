@@ -292,6 +292,7 @@ class DashboardContextTests(unittest.TestCase):
         self.assertFalse(payload["validation_ready"])
         self.assertNotIn("traceback", json.dumps(payload).lower())
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
         status, payload = self.get_json("/api/analytics/forecasts?limit=2")
         self.assertEqual(status, 200)
         self.assertEqual(payload["status"], "available")
@@ -304,6 +305,42 @@ class DashboardContextTests(unittest.TestCase):
             for key in ("result", "yes_mid", "settlement_available_at", "settlement_delay_seconds"):
                 self.assertIsNone(row[key])
         self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_contradictory_scored_populations_and_empty_wilson_clear_api_metrics(self):
+        from test_historical_analytics import HistoricalAnalyticsTests
+
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        invalid_walk = HistoricalAnalyticsTests.validation_summary(
+            scored_count=10, eligible_count=35, walk_scored_count=11)
+        invalid_interval = HistoricalAnalyticsTests.validation_summary(scored_count=0, eligible_count=35)
+        invalid_interval["forward"]["metrics"]["accuracy_wilson_95"] = {"lower": 0, "upper": 1}
+        for report in (invalid_walk, invalid_interval):
+            with self.subTest(report=report):
+                forecast_archive.validation_paths(self.state)[1].write_text(json.dumps(report))
+                status, payload = self.get_json("/api/analytics")
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], "unavailable")
+                self.assertFalse(payload["validation_ready"])
+                self.assertTrue(all(value is None for value in payload["summary"].values()))
+                self.assertTrue(all(value is None for value in payload["walk_forward"].values()))
+                self.assertTrue(all(value is None for value in payload["coverage"].values()))
+                self.assertNotIn(str(self.directory), json.dumps(payload, allow_nan=False))
+
+    def test_budget_failure_is_safe_at_both_http_endpoints(self):
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        with patch("forecast_archive.ARCHIVE_SCAN_SECONDS", 0):
+            for endpoint, collection in (("/api/analytics", "trend"),
+                                         ("/api/analytics/forecasts?limit=1", "rows")):
+                status, payload = self.get_json(endpoint)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], "unavailable")
+                self.assertEqual(payload[collection], [])
+                if "summary" in payload:
+                    self.assertTrue(all(value is None for value in payload["summary"].values()))
+                    self.assertFalse(payload["validation_ready"])
+                self.assertNotIn(str(self.directory), json.dumps(payload, allow_nan=False))
 
 
 if __name__ == "__main__":

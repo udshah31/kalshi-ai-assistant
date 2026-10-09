@@ -275,7 +275,11 @@ service defaults, these are:
   metrics, walk-forward progress, collection coverage, and report generation time.
 
 The endpoints perform no network collection, report generation, model updates, or
-state/archive/report writes, and do not create or migrate a missing database.
+application writes to state/archive/report evidence, and do not create or migrate
+a missing database. Native SQLite **WAL/SHM coordination sidecars may be created
+or updated**, and sorting may use temporary files. This is read-only SQL, not a
+promise of unchanged SHM metadata or zero filesystem mutation. Keep `mode=ro` and
+`query_only`; do not use `immutable=1`, which would break live WAL visibility.
 They can be read independently of live-price API availability. On the VM, or
 through the SSH tunnel, inspect them with:
 
@@ -309,6 +313,27 @@ window-end issue times and the recent table's browser refresh (**Archive read**)
 time. All displayed timestamps are UTC; refreshing the page does not refresh the
 saved report.
 
+Both endpoints reuse one bounded in-process archive cache: **four paths**, **10-second
+TTL** (including safe failures), with database/nonempty-WAL device/inode/size/mtime/ctime
+identity checked on every request. Empty and absent WALs are equivalent; SHM read
+marks are excluded. Changed sources invalidate reuse; changes during a scan discard
+its result. `archive_read_at` is the scan-completion Unix timestamp, separate from
+browser refresh and saved-report freshness. The saved report is projected afresh.
+
+Only **one analytics scan per process** runs at a time, using its own lock, with a
+**250-ms** maximum wait for other analytics callers. It never takes the live
+prediction/state lock. Scan limits are **1 second** (cooperative), **5,000,000 SQLite
+VM steps**, **100-ms busy timeout**, **50,000 candidate rows**, **25,000 eligible
+tickers**, **16 MiB decoded field bytes**, and **64 KiB per SQLite record/value**.
+Only the newest **149 canonical rows** are retained; newest-25 trend windows keep
+global 25-record/stride-5 alignment even for `limit=1`. All candidates, including
+duplicates, count toward scan budgets. SQLite uses a 2-MiB page-cache target and
+file-backed sorting. Exhaustion returns safe unavailable with empty archive
+rows/trend and cleared metrics, never partial-population success. Persistent
+over-budget archives need a future maintained summary or reviewed budget change;
+filesystem/scheduling stalls can exceed the cooperative deadline. Exact semantics
+and freshness distinctions are documented in the main README.
+
 See [reading historical analytics](../README.md#historical-analytics) for the
 distinct forward eligible, forward scored, and walk-forward scored populations.
 The trend uses 25-record windows, stride 5, and at least 10 valid official labels
@@ -322,8 +347,10 @@ Charts show forecast scores, not profit, and never authorize paper entries.
 
 The `CI` workflow runs automatically on pushes and pull requests. It executes the
 unit suite, Python compilation checks, shell syntax checks, and code-bundle
-inspection on Python 3.11 and 3.12. It never connects to the Oracle VM and never
-needs production credentials.
+inspection on Python 3.11 and 3.12. CI and deployment builds install/check Node 24
+for the executable renderer tests and syntax-check **each** deployment shell script.
+There is no npm install/build or Node runtime dependency. CI never connects to the
+Oracle VM and never needs production credentials.
 
 ### Configure the production environment
 

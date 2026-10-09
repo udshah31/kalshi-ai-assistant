@@ -3,7 +3,11 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +27,9 @@ START = 1800000000
 
 class HistoricalAnalyticsTests(unittest.TestCase):
     def setUp(self):
+        self.cache_patch = patch("forecast_archive._ARCHIVE_CACHE", OrderedDict())
+        self.cache_patch.start()
+        self.addCleanup(self.cache_patch.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.state_file = Path(self.directory.name) / "state.json"
@@ -164,15 +171,45 @@ class HistoricalAnalyticsTests(unittest.TestCase):
             connection.execute("UPDATE forecasts SET market_snapshot_json=?", (json.dumps(snapshot),))
         self.assertIsNone(read_recent_forecasts(self.state_file)["rows"][0]["yes_mid"])
 
-    def test_invalid_probability_quote_and_settlement_never_become_scores(self):
+    def test_invalid_probabilities_are_excluded_from_canonical_population(self):
         for index, probability in enumerate((None, float("inf"), -.1, 1.1)):
             self.insert_forecast(f"invalid-{index}", index, probability=probability,
                                  snapshot_changes={"yes_mid": float("inf")}, result="yes",
                                  settlement_changes={"available_at": START + index * 900 + 899})
         rows = read_recent_forecasts(self.state_file)["rows"]
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows, [])
+        json.dumps(rows, allow_nan=False)
+
+    def test_probability_and_forecast_identity_validation_precedes_dedup_like_evaluator(self):
+        from validation import evaluate_archive
+
+        for index, probability in enumerate((None, float("inf"), -.1, 1.1)):
+            self.insert_forecast(f"invalid-{index}", index, probability=probability, result="no")
+            self.insert_forecast(f"valid-{index}", index, probability=.8,
+                                 issued_at=START + index * 900 + 80, result="yes")
+        for index, identity in enumerate((None, "", b"invalid-id"), start=4):
+            self.insert_forecast(identity, index, result="no")
+            self.insert_forecast(f"valid-{index}", index, probability=.8,
+                                 issued_at=START + index * 900 + 80, result="yes")
+        self.insert_forecast("first-unresolved", 7, snapshot_json="{}")
+        self.insert_forecast("later-settled", 7, issued_at=START + 7 * 900 + 80, result="yes")
+        rows = read_recent_forecasts(self.state_file)["rows"]
+        self.assertEqual([row["forecast_id"] for row in rows],
+                         ["first-unresolved", *[f"valid-{i}" for i in reversed(range(7))]])
+        self.assertIsNone(rows[0]["result"])
+        evaluation = evaluate_archive(archive_path(self.state_file))
+        self.assertEqual(evaluation["forward"]["eligible_forecasts"], len(rows))
+        self.assertEqual({p["forecast_id"] for p in evaluation["forward"]["predictions"]},
+                         {row["forecast_id"] for row in rows if row["result"] is not None})
+        self.assertEqual(evaluation["forward"]["metrics"]["accuracy"], 1)
+
+    def test_invalid_quote_and_settlement_remain_unknown_for_valid_forecast(self):
+        self.insert_forecast("invalid-evidence", snapshot_changes={"yes_mid": float("inf")},
+                             result="yes", settlement_changes={"available_at": START + 899})
+        rows = read_recent_forecasts(self.state_file)["rows"]
+        self.assertEqual(len(rows), 1)
         for row in rows:
-            self.assertIsNone(row["probability_up"])
+            self.assertEqual(row["probability_up"], .8)
             self.assertIsNone(row["yes_mid"])
             self.assertIsNone(row["result"])
             self.assertIsNone(row["settlement_delay_seconds"])
@@ -234,17 +271,274 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                     with self.subTest(query=query.__name__, limit=limit), self.assertRaises(ValueError):
                         query(self.state_file, limit)
 
-    def test_queries_do_not_write_state_archive_reports_or_journal_mode(self):
+    def test_queries_make_no_application_writes_to_evidence(self):
         self.insert_forecast("settled", result="yes")
         self.state_file.write_text("unchanged-live-state")
-        before = {path: path.read_bytes() for path in Path(self.directory.name).iterdir() if path.is_file()}
+        # Native SQLite WAL/SHM coordination is permitted; evidence is not writable.
+        before = {path: path.read_bytes() for path in (self.state_file, archive_path(self.state_file))}
         with patch("forecast_archive.connect_archive", side_effect=AssertionError("writer called")):
             self.assertEqual(read_recent_forecasts(self.state_file)["status"], "available")
             read_historical_analytics(self.state_file)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
         with closing(forecast_archive._connect_archive_readonly(self.state_file)) as connection:
+            self.assertEqual(connection.execute("PRAGMA query_only").fetchone()[0], 1)
             with self.assertRaises(sqlite3.OperationalError):
                 connection.execute("DELETE FROM forecasts")
+            connection.execute("PRAGMA query_only=OFF")
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("DELETE FROM forecasts")
+
+    def insert_history(self, count, *, duplicate_ticker=False):
+        with connect_archive(archive_path(self.state_file)) as connection:
+            for index in range(count):
+                opened = START + index * 900
+                identity = f"bulk-{index:06d}"
+                ticker = "duplicate" if duplicate_ticker else identity
+                connection.execute("INSERT INTO forecasts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                    identity, "test-state", opened - 900, ticker, opened + 60,
+                    None, .8, 1, "kalshi_official", None, None, "live_archive", opened + 60))
+                connection.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?,?,?)", (
+                    identity, ticker, opened + 900, "yes" if index % 2 == 0 else "no",
+                    opened + 905, "kalshi_official", None, "live_observation"))
+
+    def test_large_history_streams_bounded_tail_with_global_windows_and_limit_parity(self):
+        self.insert_history(5007)
+        self.insert_forecast("late-retry", 5008, ticker="bulk-000000", result="no")
+        self.write_validation_summary(self.validation_summary(scored_count=5007, eligible_count=5007))
+        real_connect = sqlite3.connect
+
+        class StreamingCursor(sqlite3.Cursor):
+            def fetchall(self):
+                raise AssertionError("history must be streamed, not fetched all at once")
+
+        class StreamingConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                return self.cursor(factory=StreamingCursor).execute(sql, parameters)
+
+        def connect(*args, **kwargs):
+            return real_connect(*args, **kwargs, factory=StreamingConnection)
+
+        with patch("forecast_archive.sqlite3.connect", side_effect=connect), patch(
+                "forecast_archive._rolling_trend", wraps=forecast_archive._rolling_trend) as rolling:
+            full = read_historical_analytics(self.state_file)
+            self.assertEqual(full["status"], "available")
+            self.assertEqual([p["issued_at"] for p in full["trend"]],
+                             [START + i * 900 + 60 for i in range(4884, 5005, 5)])
+            self.assertEqual([p["accuracy"] for p in full["trend"]], [.52, .48] * 12 + [.52])
+            self.assertLessEqual(len(rolling.call_args.args[0]), 149)
+            for limit in (1, 2, 25):
+                self.assertEqual(read_historical_analytics(self.state_file, limit)["trend"], full["trend"][-limit:])
+                rows = read_recent_forecasts(self.state_file, limit)["rows"]
+                self.assertEqual([r["forecast_id"] for r in rows],
+                                 [f"bulk-{i:06d}" for i in range(5006, 5006 - limit, -1)])
+
+    def test_resource_exhaustion_never_returns_partial_rows_or_metrics(self):
+        self.insert_history(40)
+        self.write_validation_summary(self.validation_summary(scored_count=40, eligible_count=40))
+        for name, value in (("ARCHIVE_MAX_ROWS", 30), ("ARCHIVE_MAX_TICKERS", 30),
+                            ("ARCHIVE_MAX_BYTES", 100), ("ARCHIVE_SCAN_SECONDS", 0),
+                            ("ARCHIVE_MAX_VM_STEPS", 1)):
+            with self.subTest(budget=name), patch.object(forecast_archive, name, value):
+                forecast_archive._ARCHIVE_CACHE.clear()
+                for query in (read_recent_forecasts, read_historical_analytics):
+                    result = query(self.state_file, 1)
+                    self.assertEqual(result["status"], "unavailable")
+                    self.assertEqual(result.get("rows", result.get("trend")), [])
+                    if "summary" in result:
+                        self.assertTrue(all(v is None for v in result["summary"].values()))
+                        self.assertFalse(result["validation_ready"])
+                    self.assertNotIn(str(self.state_file.parent), json.dumps(result, allow_nan=False))
+
+    def test_duplicate_rows_still_exhaust_scan_budget(self):
+        self.insert_history(40, duplicate_ticker=True)
+        with patch("forecast_archive.ARCHIVE_MAX_ROWS", 30):
+            self.assertEqual(read_recent_forecasts(self.state_file, 1)["status"], "unavailable")
+
+    def test_sql_sort_work_is_interrupted_before_materialization(self):
+        self.insert_history(1000)
+        with connect_archive(archive_path(self.state_file)) as connection:
+            connection.execute("DROP INDEX forecasts_time")
+        with patch("forecast_archive.ARCHIVE_MAX_VM_STEPS", 1000), patch(
+                "forecast_archive._snapshot_conflicts", wraps=forecast_archive._snapshot_conflicts) as decoded:
+            self.assertEqual(read_recent_forecasts(self.state_file, 1)["status"], "unavailable")
+            self.assertEqual(decoded.call_count, 0)
+
+    def test_oversized_sql_record_fails_closed(self):
+        self.insert_forecast("oversized", snapshot_json=json.dumps({"extra": "x" * (70 * 1024)}))
+        self.assertEqual(read_recent_forecasts(self.state_file)["status"], "unavailable")
+
+    def test_repeated_and_concurrent_endpoints_share_one_scan(self):
+        self.insert_history(35)
+        self.write_validation_summary(self.validation_summary())
+        from dashboard import DashboardApp
+        app = DashboardApp(str(self.state_file), 1440)
+        barrier = threading.Barrier(8)
+
+        def query(index):
+            barrier.wait(timeout=3)
+            return app.analytics() if index % 2 else app.recent_forecasts(1)
+
+        with patch("forecast_archive._canonical_archive_rows", wraps=forecast_archive._canonical_archive_rows) as scan:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(query, range(8)))
+            self.assertTrue(all(r["status"] == "available" for r in results))
+            # Caller mutation must not poison another response or endpoint.
+            rows = app.recent_forecasts(25)["rows"]
+            rows[0]["probability_up"] = 0
+            self.assertEqual(app.recent_forecasts(1)["rows"][0]["probability_up"], .8)
+            app.analytics()["trend"].clear()
+            self.assertEqual(len(app.analytics()["trend"]), 3)
+            self.assertEqual(scan.call_count, 1)
+
+    def test_failed_scan_is_reused_until_cache_expiry(self):
+        self.insert_history(40)
+        with patch("forecast_archive.ARCHIVE_MAX_ROWS", 30), patch(
+                "forecast_archive._canonical_archive_rows", wraps=forecast_archive._canonical_archive_rows) as scan:
+            for query in (read_recent_forecasts, read_historical_analytics, read_recent_forecasts):
+                self.assertEqual(query(self.state_file)["status"], "unavailable")
+            self.assertEqual(scan.call_count, 1)
+
+    def test_cache_expires_and_does_not_cache_report_projection(self):
+        self.insert_forecast("original")
+        self.write_validation_summary(self.validation_summary(scored_count=0, eligible_count=1))
+        with patch("forecast_archive._canonical_archive_rows", wraps=forecast_archive._canonical_archive_rows) as scan:
+            self.assertEqual(read_historical_analytics(self.state_file)["status"], "available")
+            self.write_validation_summary({"status": "unavailable"})
+            self.assertEqual(read_historical_analytics(self.state_file)["status"], "unavailable")
+            self.assertEqual(scan.call_count, 1)
+            clock = time.monotonic()
+            with patch("forecast_archive.time.monotonic", return_value=clock + 11):
+                self.assertEqual(read_recent_forecasts(self.state_file)["status"], "available")
+            self.assertEqual(scan.call_count, 2)
+
+    def test_cache_is_capped_across_source_paths(self):
+        self.insert_forecast("original")
+        with patch("forecast_archive._canonical_archive_rows", wraps=forecast_archive._canonical_archive_rows) as scan:
+            read_recent_forecasts(self.state_file)
+            for index in range(4):
+                other = Path(self.directory.name) / f"other-{index}.json"
+                with connect_archive(archive_path(other)):
+                    pass
+                self.assertEqual(read_recent_forecasts(other)["status"], "available")
+            read_recent_forecasts(self.state_file)
+            self.assertEqual(scan.call_count, 6)
+
+    def test_wal_commits_invalidate_cache_and_remain_visible_without_checkpoint(self):
+        self.insert_forecast("original")
+        path = archive_path(self.state_file)
+        with connect_archive(path) as writer:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            before = path.read_bytes()
+            self.assertEqual(read_recent_forecasts(self.state_file)["rows"][0]["probability_up"], .8)
+            writer.execute("UPDATE forecasts SET probability_up=.6")
+            writer.commit()
+            self.assertGreater(Path(str(path) + "-wal").stat().st_size, 0)
+            self.assertEqual(path.read_bytes(), before)  # committed change lives only in WAL
+            self.assertEqual(read_recent_forecasts(self.state_file)["rows"][0]["probability_up"], .6)
+            # Checkpoint/reset also changes the evidence identity.
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            writer.execute("UPDATE forecasts SET probability_up=.4")
+            writer.commit()
+            self.assertEqual(read_recent_forecasts(self.state_file)["rows"][0]["probability_up"], .4)
+
+    def test_same_size_wal_reuse_invalidates_cached_evidence(self):
+        self.insert_forecast("original")
+        path = archive_path(self.state_file)
+        with connect_archive(path) as writer:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE forecasts SET probability_up=.6")
+            writer.commit()
+            self.assertEqual(read_recent_forecasts(self.state_file)["rows"][0]["probability_up"], .6)
+            wal = Path(str(path) + "-wal")
+            before_size = wal.stat().st_size
+            writer.execute("PRAGMA wal_checkpoint(RESTART)")
+            writer.execute("UPDATE forecasts SET probability_up=.4")
+            writer.commit()
+            self.assertEqual(wal.stat().st_size, before_size)
+            self.assertEqual(read_recent_forecasts(self.state_file)["rows"][0]["probability_up"], .4)
+
+    def test_busy_database_has_finite_wait_and_safe_failure(self):
+        self.insert_forecast("original")
+        with closing(forecast_archive._connect_archive_readonly(self.state_file)) as reader:
+            timeout = reader.execute("PRAGMA busy_timeout").fetchone()[0]
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 250)
+        # DELETE mode is only for this synthetic fixture to obtain an exclusive lock.
+        with closing(sqlite3.connect(archive_path(self.state_file))) as writer:
+            writer.execute("PRAGMA journal_mode=DELETE")
+            writer.execute("BEGIN EXCLUSIVE")
+            started = time.monotonic()
+            self.assertEqual(read_recent_forecasts(self.state_file)["status"], "unavailable")
+            self.assertLess(time.monotonic() - started, 1)
+
+    def test_scan_contention_is_bounded_and_independent_of_live_prediction_lock(self):
+        from dashboard import DashboardApp
+        self.insert_history(35)
+        self.write_validation_summary(self.validation_summary())
+        app = DashboardApp(str(self.state_file), 1440)
+        started, release = threading.Event(), threading.Event()
+        original_scan = forecast_archive._canonical_archive_rows
+
+        def delayed_scan(connection):
+            started.set()
+            self.assertTrue(release.wait(3))
+            return original_scan(connection)
+
+        with ThreadPoolExecutor(max_workers=1) as pool, patch(
+                "forecast_archive._canonical_archive_rows", side_effect=delayed_scan) as scan:
+            future = pool.submit(app.analytics)
+            try:
+                self.assertTrue(started.wait(3))
+                self.assertTrue(app._lock.acquire(timeout=.1))
+                app._lock.release()
+                before = time.monotonic()
+                self.assertEqual(app.recent_forecasts(1)["status"], "unavailable")
+                self.assertLess(time.monotonic() - before, .75)
+                self.assertEqual(scan.call_count, 1)
+                # Cached live status still works while analytics is in flight.
+                app._cache = (time.time(), {"ok": True, "synthetic": True})
+                self.assertEqual(app.status(), {"ok": True, "synthetic": True})
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=3)["status"], "available")
+        # A live status lock held by another thread cannot block either reader.
+        with app._lock, ThreadPoolExecutor(max_workers=1) as pool:
+            self.assertEqual(pool.submit(app.analytics).result(timeout=1)["status"], "available")
+            self.assertEqual(pool.submit(app.recent_forecasts, 1).result(timeout=1)["status"], "available")
+
+    def test_source_replacement_and_deletion_invalidate_cache(self):
+        self.insert_forecast("original")
+        self.assertEqual(read_recent_forecasts(self.state_file)["rows"][0]["forecast_id"], "original")
+        replacement = Path(self.directory.name) / "replacement.sqlite3"
+        with connect_archive(replacement):
+            pass
+        replacement.replace(archive_path(self.state_file))
+        self.assertEqual(read_recent_forecasts(self.state_file)["rows"], [])
+        archive_path(self.state_file).unlink()
+        self.assertEqual(read_recent_forecasts(self.state_file)["status"], "pending")
+
+    def test_changed_source_during_scan_is_discarded_before_reuse(self):
+        self.insert_forecast("original")
+        scanned, release = threading.Event(), threading.Event()
+        original_scan = forecast_archive._canonical_archive_rows
+
+        def delayed_scan(connection):
+            result = original_scan(connection)
+            scanned.set()
+            self.assertTrue(release.wait(3))
+            return result
+
+        with ThreadPoolExecutor(max_workers=1) as pool, patch(
+                "forecast_archive._canonical_archive_rows", side_effect=delayed_scan):
+            future = pool.submit(read_recent_forecasts, self.state_file)
+            try:
+                self.assertTrue(scanned.wait(3))
+                self.insert_forecast("new", 1)
+            finally:
+                release.set()
+            self.assertEqual(future.result(timeout=3)["status"], "unavailable")
+        self.assertEqual([r["forecast_id"] for r in read_recent_forecasts(self.state_file)["rows"]],
+                         ["new", "original"])
 
     @staticmethod
     def validation_summary(*, generated_at=None, scored_count=35, eligible_count=35,

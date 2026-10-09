@@ -10,9 +10,12 @@ import hashlib
 import json
 import math
 import sqlite3
+import threading
 import time
 import uuid
+from collections import OrderedDict, deque
 from contextlib import closing, contextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -21,6 +24,19 @@ ANALYTICS_LIMIT = 25
 ROLLING_WINDOW = 25
 ROLLING_STRIDE = 5
 STALE_REPORT_SECONDS = 36 * 60 * 60
+# Dashboard-only budgets; these never acquire the predictor/state transaction lock.
+ARCHIVE_SCAN_SECONDS = 1.0
+ARCHIVE_BUSY_SECONDS = 0.1
+ARCHIVE_MAX_VM_STEPS = 5_000_000
+ARCHIVE_MAX_ROWS = 50_000
+ARCHIVE_MAX_TICKERS = 25_000
+ARCHIVE_MAX_BYTES = 16 * 1024 * 1024
+ARCHIVE_MAX_RECORD_BYTES = 64 * 1024
+ARCHIVE_CACHE_SECONDS = 10.0
+ARCHIVE_CACHE_ENTRIES = 4
+ARCHIVE_CACHE_WAIT_SECONDS = 0.25
+_ARCHIVE_SCAN_LOCK = threading.Lock()
+_ARCHIVE_CACHE: OrderedDict = OrderedDict()
 MARKET_FIELDS = {
     "ticker", "event_ticker", "title", "target", "target_price", "status",
     "open_time", "close_time", "settlement_time", "result", "settlement_value",
@@ -91,7 +107,76 @@ def _connect_archive_readonly(state_file: str | Path):
     path = archive_path(state_file)
     if not path.is_file():
         return None
-    return sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True,
+                                 timeout=ARCHIVE_BUSY_SECONDS)
+    try:
+        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, ARCHIVE_MAX_RECORD_BYTES)
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA cache_size = -2048")
+        connection.execute("PRAGMA temp_store = FILE")
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _archive_identity(path: Path) -> tuple | None:
+    """Evidence identity, excluding mutable SHM coordination/read marks.
+
+    An absent and an empty WAL both contain no committed frames. Treating them
+    alike avoids invalidation from a read-only connection creating empty sidecars.
+    """
+    def signature(source: Path, *, wal: bool = False):
+        try:
+            stat = source.stat()
+        except FileNotFoundError:
+            return None
+        if wal and not stat.st_size:
+            return None
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    database = signature(path)
+    return (database, signature(Path(str(path) + "-wal"), wal=True)) if database else None
+
+
+def _read_archive_view(state_file: str | Path) -> dict[str, Any]:
+    """Single-flight bounded cache shared by both endpoints, including failures.
+
+    Hold only this analytics-specific lock. No persistent connection, live writer
+    change, or predictor lock is needed. Source changes during a scan discard its
+    result; serialization prevents an older scan from publishing over a newer one.
+    """
+    if not _ARCHIVE_SCAN_LOCK.acquire(timeout=ARCHIVE_CACHE_WAIT_SECONDS):
+        return {"status": "unavailable"}
+    try:
+        path = archive_path(state_file).resolve()
+        identity = _archive_identity(path)
+        if identity is None:
+            _ARCHIVE_CACHE.pop(path, None)
+            return {"status": "pending"}
+        cached = _ARCHIVE_CACHE.pop(path, None)
+        if cached and cached[0] == identity and time.monotonic() - cached[1] < ARCHIVE_CACHE_SECONDS:
+            _ARCHIVE_CACHE[path] = cached
+            return deepcopy(cached[2])
+        view: dict[str, Any] = {"status": "unavailable"}
+        try:
+            connection = _connect_archive_readonly(state_file)
+            if connection is not None:
+                with closing(connection):
+                    records, offset = _canonical_archive_rows(connection)
+                view = {"status": "available", "trend": _rolling_trend(records, offset),
+                        "rows": [_recent_result(row) for row in reversed(records[-ANALYTICS_LIMIT:])],
+                        "archive_read_at": time.time()}
+        except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
+            pass
+        if _archive_identity(path) != identity:
+            return {"status": "unavailable"}
+        _ARCHIVE_CACHE[path] = (identity, time.monotonic(), view)
+        while len(_ARCHIVE_CACHE) > ARCHIVE_CACHE_ENTRIES:
+            _ARCHIVE_CACHE.popitem(last=False)
+        return deepcopy(view)
+    finally:
+        _ARCHIVE_SCAN_LOCK.release()
 
 
 def _number(value: Any) -> float | None:
@@ -245,9 +330,24 @@ def _settlement_values(row: sqlite3.Row, issued_at: float,
     return result, available, available - close
 
 
-def _canonical_archive_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+def _canonical_archive_rows(connection: sqlite3.Connection) -> tuple[list[dict[str, Any]], int]:
+    """Verify the complete global population, retaining only a bounded window tail.
+
+    Every returned SQL row (including duplicates/invalid evidence) consumes budget.
+    SQLite's progress callback also bounds filtering, joins and sorting before the
+    first row reaches Python. Exhaustion raises, never yields a partial population.
+    """
+    deadline = time.monotonic() + ARCHIVE_SCAN_SECONDS
+    steps = 0
+    interval = min(1000, ARCHIVE_MAX_VM_STEPS)
+
+    def exhausted():
+        nonlocal steps
+        steps += interval
+        return steps >= ARCHIVE_MAX_VM_STEPS or time.monotonic() >= deadline
+
+    connection.set_progress_handler(exhausted, interval)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only = ON")
     rows = connection.execute("""
         SELECT f.forecast_id, f.bar_timestamp, f.market_ticker,
                f.forecast_issued_at, f.probability_up, f.market_snapshot_json,
@@ -261,14 +361,24 @@ def _canonical_archive_rows(connection: sqlite3.Connection) -> list[dict[str, An
           AND f.market_ticker IS NOT NULL
           AND f.forecast_issued_at IS NOT NULL
         ORDER BY f.forecast_issued_at ASC, f.forecast_id ASC
-    """).fetchall()
-    selected: list[dict[str, Any]] = []
+    """)
+    # 25 windows plus up to four post-stride records require at most 149 rows.
+    selected: deque[dict[str, Any]] = deque(maxlen=ROLLING_WINDOW + ANALYTICS_LIMIT * ROLLING_STRIDE - 1)
     seen_tickers: set[str] = set()
-    for row in rows:
+    materialized_bytes = 0
+    for row_count, row in enumerate(rows, 1):
+        materialized_bytes += sum(len(value.encode("utf-8")) if isinstance(value, str)
+                                  else len(value) if isinstance(value, bytes) else 8 for value in row)
+        if (row_count > ARCHIVE_MAX_ROWS or materialized_bytes > ARCHIVE_MAX_BYTES
+                or time.monotonic() >= deadline):
+            raise ValueError("archive scan budget exhausted")
         ticker = row["market_ticker"]
         issued_at = _number(row["forecast_issued_at"])
         bar_timestamp = _number(row["bar_timestamp"])
-        if (not isinstance(ticker, str) or not ticker.strip() or issued_at is None
+        probability = _number(row["probability_up"])
+        if (not isinstance(row["forecast_id"], str) or not row["forecast_id"]
+                or probability is None or not 0 <= probability <= 1
+                or not isinstance(ticker, str) or not ticker.strip() or issued_at is None
                 or bar_timestamp is None or bar_timestamp != int(bar_timestamp)):
             continue
         # validation_eligible is the archive's eligibility decision. Recheck its
@@ -281,12 +391,11 @@ def _canonical_archive_rows(connection: sqlite3.Connection) -> list[dict[str, An
             continue
         if ticker in seen_tickers:
             continue
+        if len(seen_tickers) >= ARCHIVE_MAX_TICKERS:
+            raise ValueError("archive population budget exhausted")
         seen_tickers.add(ticker)
         result, available, delay = _settlement_values(
             row, issued_at, bar_timestamp + 1800, ticker)
-        probability = _number(row["probability_up"])
-        if probability is not None and not 0 <= probability <= 1:
-            probability = None
         selected.append({
             "forecast_id": str(row["forecast_id"]),
             "issued_at": float(issued_at),
@@ -301,7 +410,9 @@ def _canonical_archive_rows(connection: sqlite3.Connection) -> list[dict[str, An
             "bar_timestamp": float(bar_timestamp),
         })
         selected[-1]["market_midpoint_available"] = selected[-1]["yes_mid"] is not None
-    return selected
+    if time.monotonic() >= deadline:
+        raise ValueError("archive scan deadline exhausted")
+    return list(selected), len(seen_tickers) - len(selected)
 
 
 def _recent_result(row: dict[str, Any]) -> dict[str, Any]:
@@ -314,22 +425,16 @@ def _recent_result(row: dict[str, Any]) -> dict[str, Any]:
 def read_recent_forecasts(state_file: str | Path, limit: int = 25) -> dict[str, Any]:
     """Read a bounded table of frozen official forecasts without creating evidence."""
     _analytics_limit(limit)
-    connection = None
     try:
-        connection = _connect_archive_readonly(state_file)
-        if connection is None:
+        view = _read_archive_view(state_file)
+        if view["status"] == "pending":
             return {"status": "pending", "reason": "Awaiting the first archived forecasts.", "rows": []}
-        with closing(connection):
-            records = _canonical_archive_rows(connection)
-        records.sort(key=lambda row: (row["issued_at"], row["forecast_id"]), reverse=True)
-        return {"status": "available", "rows": [_recent_result(row) for row in records[:limit]]}
+        if view["status"] == "available":
+            return {"status": "available", "rows": view["rows"][:limit],
+                    "archive_read_at": view["archive_read_at"]}
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
-        try:
-            if connection is not None:
-                connection.close()
-        except Exception:
-            pass
-        return {"status": "unavailable", "reason": "Archived forecasts are unavailable.", "rows": []}
+        pass
+    return {"status": "unavailable", "reason": "Archived forecasts are unavailable.", "rows": []}
 
 
 def _metric_values(metrics: Any, scored_count: int) -> dict[str, Any]:
@@ -348,7 +453,7 @@ def _metric_values(metrics: Any, scored_count: int) -> dict[str, Any]:
         result[key] = number
     interval = metrics.get("accuracy_wilson_95")
     if interval is not None:
-        if not isinstance(interval, dict):
+        if not scored_count or not isinstance(interval, dict):
             raise ValueError("invalid accuracy interval")
         lower, upper = _number(interval.get("lower")), _number(interval.get("upper"))
         if (lower is None or upper is None or not 0 <= lower <= upper <= 1):
@@ -402,7 +507,7 @@ def _report_projection(report: dict[str, Any]) -> dict[str, Any]:
     if (any(type(value) is not int or value < 0 for value in (walk_scored, walk_tested))
             or type(walk_minimum) is not int or walk_minimum < 1
             or type(walk_additional) is not int or walk_additional < 0
-            or walk_scored > walk_tested or walk_tested > eligible
+            or walk_scored > scored or walk_scored > walk_tested or walk_tested > eligible
             or walk_additional != max(0, walk_minimum - walk_scored)
             or walk.get("status") != (
                 "descriptive_evaluation" if walk_scored >= walk_minimum else "insufficient_data")):
@@ -452,9 +557,10 @@ def _report_projection(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _rolling_trend(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _rolling_trend(records: list[dict[str, Any]], offset: int = 0) -> list[dict[str, Any]]:
     trend: list[dict[str, Any]] = []
-    for end in range(ROLLING_WINDOW - 1, len(records), ROLLING_STRIDE):
+    # Offset is the number of canonical rows discarded, not SQL rows scanned.
+    for end in range(ROLLING_WINDOW - 1 + (-offset % ROLLING_STRIDE), len(records), ROLLING_STRIDE):
         window = records[end - ROLLING_WINDOW + 1:end + 1]
         scored = [row for row in window if row["result"] in {"yes", "no"}
                   and row["probability_up"] is not None]
@@ -498,25 +604,22 @@ def _analytics_with_report(report: dict[str, Any], trend: list[dict[str, Any]]) 
 def read_historical_analytics(state_file: str | Path, limit: int = 25) -> dict[str, Any]:
     """Read descriptive archive evidence independently of live prediction state."""
     _analytics_limit(limit)
-    connection = None
     trend: list[dict[str, Any]] = []
     try:
-        connection = _connect_archive_readonly(state_file)
-        if connection is None:
+        view = _read_archive_view(state_file)
+        if view["status"] == "pending":
             return _analytics_base("pending", "Awaiting the first archived forecasts.")
-        with closing(connection):
-            records = _canonical_archive_rows(connection)
-        trend = _rolling_trend(records)[-limit:]
+        if view["status"] != "available":
+            return _analytics_base("unavailable", "Historical analytics are unavailable.")
+        trend = view["trend"][-limit:]
         report = read_validation_summary(state_file)
         if report.get("status") in {"pending", "unavailable"}:
-            return _analytics_base(report["status"], report.get("reason"), trend)
-        return _analytics_with_report(report, trend)
+            result = _analytics_base(report["status"], report.get("reason"), trend)
+        else:
+            result = _analytics_with_report(report, trend)
+        result["archive_read_at"] = view["archive_read_at"]
+        return result
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError, OverflowError, RecursionError):
-        try:
-            if connection is not None:
-                connection.close()
-        except Exception:
-            pass
         return _analytics_base("unavailable", "Historical analytics are unavailable.", trend)
 
 
