@@ -1,6 +1,7 @@
 # Runtime state, market evidence, reports, locks, and local backups
 data/
 __agent__/
+.worktrees/
 *.sqlite3
 *.sqlite3-*
 *.json.lock
