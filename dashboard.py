@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -11,9 +12,14 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-from forecast_archive import read_context_comparison, read_validation_summary
+from forecast_archive import (
+    read_context_comparison,
+    read_historical_analytics,
+    read_recent_forecasts,
+    read_validation_summary,
+)
 
 from btc_predictor import (
     DEFAULT_LOOKBACK_MINUTES,
@@ -564,6 +570,12 @@ class DashboardApp:
     def context_comparison(self) -> dict[str, Any]:
         return read_context_comparison(self.state_file)
 
+    def analytics(self) -> dict[str, Any]:
+        return read_historical_analytics(self.state_file)
+
+    def recent_forecasts(self, limit: int) -> dict[str, Any]:
+        return read_recent_forecasts(self.state_file, limit)
+
     def status(self) -> dict[str, Any]:
         now = time.time()
         with self._lock:
@@ -645,6 +657,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        self._send(body, "application/json; charset=utf-8", status)
+
+    @staticmethod
+    def _unavailable_analytics() -> dict[str, str]:
+        return {"status": "unavailable", "reason": "Historical analytics are unavailable."}
+
+    @staticmethod
+    def _unavailable_forecasts() -> dict[str, Any]:
+        return {
+            "status": "unavailable",
+            "reason": "Archived forecasts are unavailable.",
+            "rows": [],
+        }
+
+    @staticmethod
+    def _parse_limit(value: str) -> int:
+        if not value or not value.isdecimal():
+            raise ValueError("invalid analytics limit")
+        limit = int(value)
+        if not 1 <= limit <= 25:
+            raise ValueError("invalid analytics limit")
+        return limit
+
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
@@ -656,6 +693,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/context-comparison":
             self._send(json.dumps(self.app.context_comparison(), allow_nan=False).encode("utf-8"),
                        "application/json; charset=utf-8")
+            return
+        if path == "/api/analytics":
+            try:
+                self._json(self.app.analytics())
+            except (OSError, sqlite3.Error, ValueError, KeyError, json.JSONDecodeError):
+                self._json(self._unavailable_analytics())
+            return
+        if path == "/api/analytics/forecasts":
+            query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+            try:
+                limit = self._parse_limit(query.get("limit", ["25"])[0])
+            except (TypeError, ValueError):
+                self._json({"error": "invalid analytics limit"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                self._json(self.app.recent_forecasts(limit))
+            except (OSError, sqlite3.Error, ValueError, KeyError, json.JSONDecodeError):
+                self._json(self._unavailable_forecasts())
             return
         if path == "/api/status":
             payload = self.app.status()

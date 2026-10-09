@@ -8,6 +8,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import forecast_archive
 from dashboard import DashboardApp, DashboardHandler
@@ -54,6 +55,35 @@ class DashboardContextTests(unittest.TestCase):
 
     def write_report(self, value=None):
         self.comparison.write_text(json.dumps(report() if value is None else value), encoding="utf-8")
+
+    def get_json(self, path):
+        class QuietHandler(DashboardHandler):
+            app = DashboardApp(str(self.state), 1440)
+
+            def log_message(self, *unused):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}{path}", timeout=5) as response:
+                    return response.status, json.load(response)
+            except HTTPError as error:
+                try:
+                    body = error.read()
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError:
+                        payload = body.decode("utf-8")
+                    return error.code, payload
+                finally:
+                    error.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
 
     def test_saved_report_exposes_distinct_full_and_quote_matched_metrics(self):
         self.write_report()
@@ -149,6 +179,66 @@ class DashboardContextTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             worker.join(timeout=5)
+
+    def test_analytics_api_returns_compact_payload_without_network_calls(self):
+        expected = {
+            "status": "available",
+            "summary": {"scored_count": 10},
+            "trend": [{"count": 10}],
+            "coverage": {"timely": 10},
+        }
+        with patch("dashboard.read_historical_analytics", return_value=expected) as reader:
+            with patch("dashboard.fetch_candles", side_effect=AssertionError("analytics fetched live prices")):
+                status, payload = self.get_json("/api/analytics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, expected)
+        reader.assert_called_once_with(self.state)
+
+    def test_forecasts_api_returns_requested_bounded_rows_without_network_calls(self):
+        rows = [{"forecast_id": str(index)} for index in range(25)]
+
+        def recent_forecasts(state_file, limit):
+            self.assertEqual(state_file, self.state)
+            return {"status": "available", "rows": rows[:limit]}
+
+        with patch("dashboard.read_recent_forecasts", side_effect=recent_forecasts) as reader:
+            with patch("dashboard.fetch_candles", side_effect=AssertionError("analytics fetched live prices")):
+                status, payload = self.get_json("/api/analytics/forecasts?limit=25")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["rows"]), 25)
+        self.assertEqual(payload["rows"][0]["forecast_id"], "0")
+        reader.assert_called_once_with(self.state, 25)
+
+    def test_invalid_forecast_limits_return_safe_json_400(self):
+        for limit in ("0", "26", "not-a-number", "1.5"):
+            with self.subTest(limit=limit):
+                status, payload = self.get_json(f"/api/analytics/forecasts?limit={limit}")
+                self.assertEqual(status, 400)
+                self.assertEqual(payload, {"error": "invalid analytics limit"})
+
+    def test_missing_or_malformed_analytics_reports_are_safe_and_read_only(self):
+        status, payload = self.get_json("/api/analytics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "pending")
+        status, payload = self.get_json("/api/analytics/forecasts?limit=25")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "pending")
+        self.assertFalse(self.state.exists())
+        self.assertFalse(forecast_archive.archive_path(self.state).exists())
+
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        self.state.write_bytes(b"existing-live-state")
+        validation_summary = forecast_archive.validation_paths(self.state)[1]
+        validation_summary.write_bytes(b"{ malformed")
+        paths = (self.state, forecast_archive.archive_path(self.state), validation_summary)
+        before = {path: path.read_bytes() for path in paths}
+        status, payload = self.get_json("/api/analytics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertFalse(payload["validation_ready"])
+        self.assertNotIn("traceback", json.dumps(payload).lower())
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
 
 
 if __name__ == "__main__":
