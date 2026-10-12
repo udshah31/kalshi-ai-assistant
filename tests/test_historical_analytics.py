@@ -71,8 +71,11 @@ class HistoricalAnalyticsTests(unittest.TestCase):
                 settlement = {"forecast_id": identity, "market_ticker": ticker,
                               "market_close_time": opened + 900, "result": result,
                               "available_at": opened + 905, "outcome_source": "kalshi_official",
-                              "snapshot_json": json.dumps({"ticker": ticker, "close_time": opened + 900,
-                                                          "result": result}), "provenance": "live_observation"}
+                              "snapshot_json": json.dumps({"ticker": ticker, "open_time": opened,
+                                                          "close_time": opened + 900,
+                                                          "status": "finalized", "result": result,
+                                                          "settlement_time": opened + 905}),
+                              "provenance": "live_observation"}
                 settlement.update(settlement_changes or {})
                 connection.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?,?,?)", tuple(settlement.values()))
 
