@@ -97,6 +97,8 @@ def initial_prediction_cycle(now: float | None = None) -> int | None:
 def recommendation_needs_retry(prediction: dict[str, Any], now: float) -> bool:
     """Retry late settlements without a browser; retry entry data only early on."""
     checks = prediction.get("signal_checks") or {}
+    if prediction.get("settlement_queue_size", 0) > 0:
+        return True
     if checks.get("pending_slot") is False:
         return True
     if prediction.get("forecast_status") == "awaiting_market_evidence":

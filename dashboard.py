@@ -36,6 +36,7 @@ from btc_predictor import (
     load_state,
     paper_trade_summary,
     predict_and_queue,
+    recover_settlements_without_prices,
     save_state,
     state_transaction,
 )
@@ -800,10 +801,10 @@ HTML = r"""<!doctype html>
         const match = paperTrade ? (paperTrade.correct ? 'MATCH' : 'MISS') : learned.outcome;
         const pnlText = paperTrade ? ` ${paperTrade.pnl >= 0 ? '+' : ''}$${Number(paperTrade.pnl).toFixed(3)} hypothetical score P&L (not account money).` : '';
         set('learning', `Prediction match: ${match}`);
-        set('learning-detail', `Label source: ${learned.outcome_source || 'legacy Coinbase proxy'} • ${learned.market_ticker || 'no exact ticker'}. Probability before update: ${pct(learned.probability_before_update)}.${pnlText}`);
+        set('learning-detail', `Label source: ${learned.outcome_source || 'legacy Coinbase proxy'} • ${learned.market_ticker || 'no exact ticker'}. ${learned.status === 'reconciled' ? 'Legacy result reconciled; no duplicate model update.' : `Probability before update: ${pct(learned.probability_before_update)}.`}${pnlText}`);
       } else {
         set('learning', 'No new official result this refresh');
-        set('learning-detail', 'Waiting for the queued exact-market settlement; Coinbase direction is not a substitute.');
+        set('learning-detail', `${prediction.settlement_queue_size || 0} earlier forecasts awaiting finalized results. Collection continues while settlement retries run.`);
       }
       $('learning-detail').className = 'small';
       set('status-text', `Live • updated ${new Date(payload.generated_at).toLocaleTimeString()}`);
@@ -913,7 +914,23 @@ class DashboardApp:
                         learned = None
                         bootstrapped = True
 
-                    prediction = predict_and_queue(model, state, bars, kalshi)
+                    try:
+                        prediction = predict_and_queue(model, state, bars, kalshi)
+                    except ValueError as exc:
+                        # Preserve results already received before a feature-history
+                        # failure; another network lookup may no longer succeed.
+                        archive_and_guard(self.state_file, state, bars, raw_candles=raw,
+                                          prices_observed_at=prices_observed_at)
+                        save_state(self.state_file, model, state)
+                        payload = {
+                            "ok": False,
+                            "generated_at": datetime.now(timezone.utc).isoformat(),
+                            "error": str(exc),
+                            "learned_previous": learned,
+                            "demo_account": demo_account_summary(state),
+                        }
+                        self._cache = (now, payload)
+                        return payload
                     prediction = finalize_prediction(prediction, state)
                     prediction = archive_and_guard(self.state_file, state, bars, prediction, raw_candles=raw,
                                                    prices_observed_at=prices_observed_at)
@@ -939,6 +956,11 @@ class DashboardApp:
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "error": str(exc),
                 }
+                if isinstance(exc, (RuntimeError, OSError, ValueError)):
+                    try:
+                        payload.update(recover_settlements_without_prices(self.state_file))
+                    except (RuntimeError, OSError, ValueError):
+                        pass  # retain an error response; the runner will retry recovery
             self._cache = (now, payload)
             return payload
 

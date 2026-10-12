@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import live_runner
 from btc_predictor import OnlineLogisticRegression, new_state
+from finalized_fixtures import finalized_history
 
 
 WEBHOOK = "https://discord.com/api/webhooks/123/test-secret"
@@ -48,24 +49,14 @@ class MilestoneAlertTests(unittest.TestCase):
     def save_state(self, count=100, state_id="run-A"):
         state = new_state(OnlineLogisticRegression(7))
         state["state_id"] = state_id
-        state["paper_trades"] = [
-            {"market_ticker": f"KXBTC15M-{i}", "outcome_source": "kalshi_official",
-             "validation_eligible": True, "probability_up": .6,
-             "outcome": "UP" if i < 40 else "DOWN", "correct": i < 40}
-            for i in range(count)
-        ]
+        state["paper_trades"] = finalized_history(count, probability=.6, wins=40, prefix="KXBTC15M-")
         self.state_file.write_text(json.dumps(state))
         return state
 
     def save_ready_state(self):
         state = new_state(OnlineLogisticRegression(7))
         state["state_id"] = "ready-run"
-        state["paper_trades"] = [
-            {"market_ticker": f"KXBTC15M-ready-{i}", "outcome_source": "kalshi_official",
-             "validation_eligible": True, "probability_up": .6,
-             "outcome": "UP" if i < 60 else "DOWN", "correct": i < 60}
-            for i in range(100)
-        ]
+        state["paper_trades"] = finalized_history(100, probability=.6, wins=60, prefix="KXBTC15M-ready-")
         self.state_file.write_text(json.dumps(state))
         return state
 

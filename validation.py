@@ -27,6 +27,7 @@ from btc_predictor import (
     MIN_LIVE_SAMPLES,
     MIN_SECONDS_TO_CLOSE,
     OnlineLogisticRegression,
+    is_finalized_result,
     optional_number,
     timestamp_seconds,
 )
@@ -175,6 +176,8 @@ def _official_result(forecast: dict[str, Any], row: dict[str, Any] | None) -> tu
     reasons.extend(_snapshot_errors(snapshot, forecast["market_ticker"], forecast["opened_at"], forecast["closed_at"]))
     if snapshot is not None and "result" in snapshot and snapshot["result"] != row["result"]:
         reasons.append("settlement_snapshot_label_mismatch")
+    if not is_finalized_result(snapshot, forecast["market_ticker"], forecast["closed_at"], available):
+        reasons.append("settlement_not_finalized_or_finalization_time_invalid")
     if reasons:
         return None, reasons
     return {"label": int(row["result"] == "yes"), "available_at": available}, []
@@ -919,7 +922,7 @@ def evaluate_archive(path: str | Path, train_size: int = 100, calibration_size: 
         "paper_account": _paper_account(rows["paper_entries"], all_forecasts, settlement_map),
         "limitations": [
             "Offline report only: no live probabilities, model files, approvals, or trade gates are changed.",
-            "Only exact archived official Kalshi results are scored; Coinbase proxy outcomes and candle-derived labels are not used.",
+            "Only exact archived finalized Kalshi results with a valid settlement timestamp are scored; provisional, proxy and candle-derived labels are excluded.",
             "Missing features exclude retraining, not otherwise valid frozen forward scoring. Missing/stale quotes never become invented prices.",
             "Label availability is the first local observation, not market close; strict pre-block availability is required for training and calibration.",
             "Platt calibration is EXPERIMENTAL, fit on held-out past records, frozen for each test block, and never applied live.",

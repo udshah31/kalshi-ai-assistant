@@ -1,7 +1,7 @@
 """Durable, point-in-time public-data archive; no credentials or order execution.
 
 SQLite is independent of the bounded JSON model state. First-issued forecasts,
-first-observed settlements, and committed paper entries are immutable. Older
+result observations, finalized settlements, and committed entries are immutable. Older
 state records are explicitly imported, never reconstructed from today's prices.
 """
 from __future__ import annotations
@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS settlements (
  market_close_time REAL NOT NULL, result TEXT NOT NULL CHECK(result IN ('yes','no')),
  available_at REAL NOT NULL, outcome_source TEXT NOT NULL,
  snapshot_json TEXT, provenance TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS settlement_observations (
+ observation_id TEXT PRIMARY KEY, forecast_id TEXT NOT NULL REFERENCES forecasts(forecast_id),
+ market_ticker TEXT NOT NULL, market_close_time REAL NOT NULL, result TEXT,
+ available_at REAL NOT NULL, outcome_source TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+ provenance TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS settlement_observations_forecast ON settlement_observations(forecast_id);
 CREATE TABLE IF NOT EXISTS paper_entries (
  forecast_id TEXT PRIMARY KEY REFERENCES forecasts(forecast_id), entered_at REAL NOT NULL,
  side TEXT NOT NULL, quantity INTEGER NOT NULL, entry_price REAL NOT NULL,
@@ -658,13 +664,25 @@ def connect_archive(path: str | Path):
     try:
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA foreign_keys=ON")
+        metadata_exists = connection.execute("SELECT 1 FROM sqlite_master WHERE name='archive_metadata'").fetchone()
+        version = connection.execute("SELECT value FROM archive_metadata WHERE key='schema_version'").fetchone() if metadata_exists else None
+        if version and int(version[0]) not in READABLE_SCHEMA_VERSIONS:
+            raise ValueError("Unsupported forecast archive schema version")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.executescript(SCHEMA)
-        version = connection.execute("SELECT value FROM archive_metadata WHERE key='schema_version'").fetchone()
-        if version and int(version[0]) != SCHEMA_VERSION:
-            raise ValueError("Unsupported forecast archive schema version")
-        connection.execute("INSERT OR IGNORE INTO archive_metadata VALUES ('schema_version',?)", (str(SCHEMA_VERSION),))
+        # Additive upgrade: retain all v1 settlement evidence, including provisional
+        # rows. A later finalized observation may advance only a provisional row.
+        if version and int(version[0]) == 1:
+            for row in connection.execute("SELECT * FROM settlements").fetchall():
+                identity, ticker, close, result, available, source, snapshot_json, provenance = row
+                try:
+                    snapshot = json.loads(snapshot_json)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(snapshot, dict):
+                    _record_observation(connection, identity, ticker, close, available, snapshot, provenance)
+        connection.execute("INSERT OR REPLACE INTO archive_metadata VALUES ('schema_version',?)", (str(SCHEMA_VERSION),))
         connection.commit()
         with connection:
             yield connection
@@ -740,7 +758,19 @@ def _review(value: Any) -> dict[str, Any] | None:
     return result
 
 
+def _record_observation(connection, identity, ticker, close, available, snapshot, provenance):
+    snapshot = _public(snapshot, MARKET_FIELDS)
+    if not snapshot or snapshot.get("ticker") != ticker or close is None or available is None:
+        return
+    connection.execute("INSERT OR IGNORE INTO settlement_observations VALUES (?,?,?,?,?,?,?,?,?)", (
+        _id(identity, snapshot), identity, ticker, close, snapshot.get("result"), available,
+        "kalshi_official", _json(snapshot), provenance,
+    ))
+
+
 def _record_settlement(connection, identity, record, provenance, now):
+    from btc_predictor import is_finalized_result
+
     if record.get("outcome_source") != "kalshi_official" or not identity:
         return
     snapshot = _public(record.get("official_result_snapshot"), MARKET_FIELDS)
@@ -748,17 +778,39 @@ def _record_settlement(connection, identity, record, provenance, now):
     close = _timestamp(record.get("market_close_time"))
     available = _number(record.get("settled_at"))
     expected_close = int(record["bar_timestamp"]) + 1800
-    if (not snapshot or snapshot.get("ticker") != ticker or snapshot.get("result") not in {"yes", "no"}
-            or close != expected_close or _timestamp(snapshot.get("close_time")) != expected_close
-            or available is None or not expected_close <= available <= now
-            or record.get("outcome") != ("UP" if snapshot["result"] == "yes" else "DOWN")):
-        return  # a legacy direction is not an official settlement observation
     original = connection.execute("SELECT provenance FROM forecasts WHERE forecast_id=?", (identity,)).fetchone()
     if original and original[0] == "live_archive":
         provenance = "live_observation"
-    connection.execute("INSERT OR IGNORE INTO settlements VALUES (?,?,?,?,?,?,?,?)", (
-        identity, ticker, close, snapshot["result"], available, "kalshi_official", _json(snapshot), provenance,
-    ))
+    for observation in record.get("settlement_observations") or []:
+        observed = _number(observation.get("available_at"))
+        stage = observation.get("snapshot")
+        if isinstance(stage, dict) and observed is not None and expected_close <= observed <= now:
+            _record_observation(connection, identity, ticker, _timestamp(stage.get("close_time")),
+                                observed, stage, provenance)
+    if snapshot and available is not None and expected_close <= available <= now:
+        _record_observation(connection, identity, ticker, close, available, snapshot, provenance)
+    if (not snapshot or snapshot.get("ticker") != ticker or snapshot.get("result") not in {"yes", "no"}
+            or close != expected_close or _timestamp(snapshot.get("close_time")) != expected_close
+            or available is None or not expected_close <= available <= now
+            or not is_finalized_result(snapshot, ticker, expected_close, available)
+            or record.get("outcome") != ("UP" if snapshot["result"] == "yes" else "DOWN")):
+        return  # provisional observations cannot supply a finalized training label
+    existing = connection.execute("SELECT * FROM settlements WHERE forecast_id=?", (identity,)).fetchone()
+    values = (identity, ticker, close, snapshot["result"], available, "kalshi_official", _json(snapshot), provenance)
+    if existing:
+        try:
+            previous = json.loads(existing[6])
+        except (ValueError, TypeError):
+            previous = None
+        if isinstance(previous, dict) and is_finalized_result(previous, existing[1], existing[2], existing[4]):
+            return  # first finalized result is immutable
+        if isinstance(previous, dict):
+            _record_observation(connection, identity, existing[1], existing[2], existing[4], previous, existing[7])
+        connection.execute("""UPDATE settlements SET market_ticker=?, market_close_time=?, result=?,
+            available_at=?, outcome_source=?, snapshot_json=?, provenance=? WHERE forecast_id=?""",
+                           (*values[1:], identity))
+    else:
+        connection.execute("INSERT INTO settlements VALUES (?,?,?,?,?,?,?,?)", values)
 
 
 def validation_paths(state_file: str | Path) -> tuple[Path, Path]:
@@ -872,7 +924,7 @@ def _record_entry(connection, identity, record):
 
 def _summary(connection, path, now):
     counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-              for table in ("candles", "bars", "forecasts", "settlements", "decisions", "paper_entries", "legacy_scores", "skipped_forecasts")}
+              for table in ("candles", "bars", "forecasts", "settlements", "settlement_observations", "decisions", "paper_entries", "legacy_scores", "skipped_forecasts")}
     return {"status": "ok", "path": str(Path(path)), "schema_version": SCHEMA_VERSION,
             "last_collected_at": now, "counts": counts,
             "note": "Point-in-time collection; state imports are identified, not reconstructed."}
@@ -916,6 +968,11 @@ def record_cycle(
         identity = _record_forecast(connection, state_id, pending, "live_archive", now) if pending else None
         if pending:
             _record_entry(connection, identity, pending)
+            _record_settlement(connection, identity, pending, "live_observation", now)
+        for queued in [*(state.get("settlement_queue") or {}).values(), *(state.get("unresolved_demo_trades") or [])]:
+            queued_id = _record_forecast(connection, state_id, queued, "live_archive", now)
+            _record_entry(connection, queued_id, queued)
+            _record_settlement(connection, queued_id, queued, "live_observation", now)
         for entry in (state.get("demo_account") or {}).get("demo_trades") or []:
             # New account settlements carry original entry evidence. Older entries
             # without entry timestamps/quotes are deliberately not reconstructed.

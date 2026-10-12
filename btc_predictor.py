@@ -17,6 +17,7 @@ import math
 import os
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -45,7 +46,10 @@ MAX_QUOTE_AGE_SECONDS = 60
 MAX_ENTRY_DELAY_SECONDS = 120  # model is a start-of-window forecast, not intrawindow
 MIN_SECONDS_TO_CLOSE = 60
 PAPER_COST_ALLOWANCE = 0.03  # 2c fees + 1c slippage ASSUMPTION, not an actual fee schedule
-MAX_SETTLEMENT_DELAY_SECONDS = 3600
+MAX_SETTLEMENT_DELAY_SECONDS = 3600  # delayed marker, never a reason to discard an official forecast
+SETTLEMENT_RETRY_SECONDS = 30
+DELAYED_SETTLEMENT_RETRY_SECONDS = 300
+MAX_SETTLEMENT_LOOKUPS_PER_CYCLE = 3
 TYPESAFE_API_KEY_ENV = "TYPESAFE_API_KEY"
 TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 FEATURE_NAMES = (
@@ -377,6 +381,30 @@ def timestamp_seconds(value: Any) -> float | None:
         return None
 
 
+def is_finalized_result(
+    market: dict[str, Any] | None, ticker: str, expected_close: float, observed_at: float | None,
+) -> bool:
+    """Only a paid-out, exact-market result can supply a learning/account label."""
+    if not isinstance(market, dict):
+        return False
+    settled = timestamp_seconds(market.get("settlement_time"))
+    return bool(ticker and market.get("ticker") == ticker
+                and market.get("status") == "finalized" and market.get("result") in {"yes", "no"}
+                and timestamp_seconds(market.get("close_time")) == expected_close
+                and settled is not None and observed_at is not None
+                and expected_close <= settled <= observed_at)
+
+
+def _finalized_score(record: dict[str, Any]) -> bool:
+    bar = optional_number(record.get("bar_timestamp"))
+    snapshot = record.get("official_result_snapshot") or {}
+    return bool(bar is not None
+                and timestamp_seconds(record.get("market_close_time")) == bar + 2 * INTERVAL_SECONDS
+                and is_finalized_result(snapshot, record.get("market_ticker"), bar + 2 * INTERVAL_SECONDS,
+                                        timestamp_seconds(record.get("settled_at")))
+                and record.get("outcome") == ("UP" if snapshot.get("result") == "yes" else "DOWN"))
+
+
 def normalize_kalshi_market(market: dict[str, Any]) -> dict[str, Any]:
     """Public market metadata; preserve missing price/size fields as None."""
     result = {
@@ -435,9 +463,18 @@ def orderbook_quotes(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def fetch_kalshi_market_by_ticker(ticker: str, timeout: int = 10) -> dict[str, Any]:
-    url = "https://api.elections.kalshi.com/trade-api/v2/markets/" + urllib.parse.quote(ticker, safe="")
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        payload = json.load(response)
+    base = "https://api.elections.kalshi.com/trade-api/v2/"
+    encoded = urllib.parse.quote(ticker, safe="")
+    try:
+        with urllib.request.urlopen(base + "markets/" + encoded, timeout=timeout) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        exc.close()
+        # Long-delayed reconciliation can outlive the exchange's live-data cutoff.
+        with urllib.request.urlopen(base + "historical/markets/" + encoded, timeout=timeout) as response:
+            payload = json.load(response)
     if not isinstance(payload.get("market"), dict):
         raise RuntimeError("Kalshi market result unavailable")
     return normalize_kalshi_market(payload["market"])
@@ -805,6 +842,9 @@ def new_state(model: OnlineLogisticRegression) -> dict[str, Any]:
         "feature_names": list(FEATURE_NAMES),
         "model": model.to_dict(),
         "pending": None,
+        "settlement_queue": {},
+        "learned_settlements": {},
+        "revised_learning_labels": {},
         "paper_trades": [],
         "skipped_predictions": [],
         "unresolved_demo_trades": [],
@@ -907,7 +947,7 @@ def settle_demo_trade(pending: dict[str, Any], label: int, next_bar: WindowBar |
         "pnl": pnl,
         "entry_close": float(pending["close"]),
         "exit_close": pending.get("official_expiration_value") if pending.get("outcome_source") == "kalshi_official" else (next_bar.close if next_bar else None),
-        "exit_timestamp": int(pending["bar_timestamp"]) + INTERVAL_SECONDS,
+        "exit_timestamp": int(pending["bar_timestamp"]) + 2 * INTERVAL_SECONDS,
         "market_ticker": pending.get("market_ticker"),
         "market_close_time": pending.get("market_close_time"),
         "outcome_source": pending.get("outcome_source", "coinbase_proxy"),
@@ -917,6 +957,7 @@ def settle_demo_trade(pending: dict[str, Any], label: int, next_bar: WindowBar |
         "validation_eligible": pending.get("validation_eligible", True),
         "market_snapshot": pending.get("market_snapshot"),
         "official_result_snapshot": pending.get("official_result_snapshot"),
+        "settlement_observations": pending.get("settlement_observations", []),
         "settled_at": pending.get("settled_at"),
         "scoring_note": "Hypothetical one-contract match; not an account trade or net return.",
     }
@@ -948,6 +989,7 @@ def official_validation(state: dict[str, Any]) -> dict[str, Any]:
         ticker = trade.get("market_ticker")
         probability = optional_number(trade.get("probability_up"))
         if (trade.get("outcome_source") == "kalshi_official" and trade.get("validation_eligible", True)
+                and _finalized_score(trade)
                 and ticker and ticker not in seen
                 and probability is not None and 0 <= probability <= 1 and trade.get("outcome") in {"UP", "DOWN"}):
             seen.add(ticker)
@@ -1069,6 +1111,10 @@ def learning_analysis(
         blocks.append("durable data archive unavailable; new paper entries withheld")
     if state.get("unresolved_demo_trades"):
         blocks.append("unresolved committed paper entry requires settlement review; no new account trades")
+    if any(_committed_entry(record) for record in (state.get("settlement_queue") or {}).values()):
+        blocks.append("committed paper entry awaiting finalized settlement; no overlapping account trades")
+    if state.get("revised_learning_labels"):
+        blocks.append("a legacy learned label changed at finalization; retrain before new paper entries")
     if drawdown >= 0.10:
         blocks.append(f"demo drawdown is {drawdown:.1%}")
 
@@ -1156,7 +1202,7 @@ def settle_demo_account(
         "pnl": pnl,
         "entry_close": float(pending["close"]),
         "exit_close": pending.get("official_expiration_value") if pending.get("outcome_source") == "kalshi_official" else (next_bar.close if next_bar else None),
-        "exit_timestamp": int(pending["bar_timestamp"]) + INTERVAL_SECONDS,
+        "exit_timestamp": int(pending["bar_timestamp"]) + 2 * INTERVAL_SECONDS,
         "market_ticker": pending.get("market_ticker"),
         "outcome_source": pending.get("outcome_source", "coinbase_proxy"),
         "cost_allowance_per_contract": pending.get("cost_allowance_per_contract", 0),
@@ -1167,6 +1213,7 @@ def settle_demo_account(
         "trade_committed_at": pending.get("trade_committed_at"),
         "forecast_issued_at": pending.get("forecast_issued_at"),
         "official_result_snapshot": pending.get("official_result_snapshot"),
+        "settled_at": pending.get("settled_at"),
     }
     account["balance"] = float(account["balance"]) + pnl
     account["total_traded"] = float(account["total_traded"]) + cost
@@ -1188,7 +1235,10 @@ def demo_account_summary(state: dict[str, Any]) -> dict[str, Any]:
         "starting_balance": float(account["starting_balance"]),
         "balance": float(account["balance"]),
         "budget_per_trade": float(account["budget_per_trade"]),
-        "unresolved_trades": len(state.get("unresolved_demo_trades") or []),
+        "unresolved_trades": len({_settlement_key(record) for record in (
+            *(state.get("unresolved_demo_trades") or []),
+            *(state.get("settlement_queue") or {}).values(),
+        ) if _committed_entry(record)}),
         "total_traded": float(account["total_traded"]),
         "realized_pnl": float(account["realized_pnl"]),
         "trades": total,
@@ -1202,89 +1252,199 @@ def demo_account_summary(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _settlement_key(record: dict[str, Any]) -> str:
+    return str(record.get("market_ticker") or
+               f"{record.get('outcome_source', 'coinbase_proxy')}:{record['bar_timestamp']}")
+
+
+def _committed_entry(record: dict[str, Any]) -> bool:
+    return record.get("trade_signal") == "TRADE" and int(record.get("demo_quantity") or 0) > 0
+
+
+def _remember_settlement(record: dict[str, Any], market: dict[str, Any], observed_at: float) -> None:
+    """Keep first receipt of each result stage, including provisional observations."""
+    if market.get("ticker") != record.get("market_ticker"):
+        return
+    observations = record.setdefault("settlement_observations", [])
+    fields = ("ticker", "close_time", "status", "result", "settlement_time", "expiration_value")
+    identity = {key: market.get(key) for key in fields}
+    if not any({key: entry["snapshot"].get(key) for key in fields} == identity for entry in observations):
+        observations.append({"available_at": observed_at, "snapshot": dict(market)})
+
+
+def _prepare_settlement_queue(state: dict[str, Any], now: float) -> dict[str, dict[str, Any]]:
+    """Release the forecast slot at close, keeping every outstanding ticker durable."""
+    queue = state.setdefault("settlement_queue", {})
+    learned = state.setdefault("learned_settlements", {})
+    pending = state.get("pending")
+    if pending and int(pending["bar_timestamp"]) + 2 * INTERVAL_SECONDS <= now:
+        queue.setdefault(_settlement_key(pending), pending)
+        state["pending"] = None
+    for record in state.get("unresolved_demo_trades") or []:
+        if record.get("outcome_source") == "kalshi_official" and record.get("market_ticker"):
+            queue.setdefault(_settlement_key(record), record)
+    account_trades = {trade.get("market_ticker"): trade
+                      for trade in (state.get("demo_account") or {}).get("demo_trades", [])}
+    for score in state.get("paper_trades") or []:
+        if score.get("outcome_source") != "kalshi_official" or not score.get("market_ticker"):
+            continue
+        key = _settlement_key(score)
+        if _finalized_score(score):
+            learned.setdefault(key, {"label": int(score["outcome"] == "UP"), "available_at": score["settled_at"]})
+        elif key not in learned and key not in queue and score.get("bar_timestamp") is not None:
+            # Older versions already taught/paid provisional labels. Reconcile the
+            # evidence and account delta, but never apply that training sample twice.
+            record = {**score, "close": score.get("entry_close"), "demo_side": score.get("side"),
+                      "demo_entry_price": score.get("entry_price"), "demo_entry_source": score.get("entry_source"),
+                      "reconcile_only": True, "previous_label": int(score.get("outcome") == "UP"),
+                      "settlement_observations": list(score.get("settlement_observations") or [])}
+            account_trade = account_trades.get(key)
+            if account_trade:
+                record.update({"trade_signal": "TRADE", "demo_quantity": account_trade["quantity"],
+                               "demo_cost": account_trade["cost"]})
+            observed = timestamp_seconds(score.get("settled_at"))
+            if score.get("official_result_snapshot") and observed is not None:
+                _remember_settlement(record, score["official_result_snapshot"], observed)
+            queue[key] = record
+    return queue
+
+
+def _reconcile_legacy_settlement(state: dict[str, Any], record: dict[str, Any], label: int) -> dict[str, Any] | None:
+    """Correct previously paid provisional paper P&L without inventing a new fill."""
+    if record["previous_label"] != label:
+        state.setdefault("revised_learning_labels", {})[_settlement_key(record)] = {
+            "learned_label": record["previous_label"], "final_label": label,
+            "available_at": record["settled_at"],
+        }
+    account = ensure_demo_account(state)
+    for trade in account["demo_trades"]:
+        if trade.get("market_ticker") != record.get("market_ticker"):
+            continue
+        correct = (trade["side"] == "UP") == bool(label)
+        payout = float(trade["quantity"]) if correct else 0.0
+        pnl = payout - float(trade["cost"])
+        delta = pnl - float(trade["pnl"])
+        win_delta = int(correct) - int(bool(trade["correct"]))
+        account["balance"] += delta
+        account["realized_pnl"] += delta
+        account["wins"] += win_delta
+        account["losses"] -= win_delta
+        trade.update({"correct": correct, "outcome": "UP" if label else "DOWN", "payout": payout, "pnl": pnl,
+                      "exit_timestamp": int(record["bar_timestamp"]) + 2 * INTERVAL_SECONDS,
+                      "exit_close": record["official_expiration_value"], "settled_at": record["settled_at"],
+                      "official_result_snapshot": record["official_result_snapshot"]})
+        return trade
+    return None
+
+
 def learn_from_pending(
     model: OnlineLogisticRegression,
     state: dict[str, Any],
     bars: Sequence[WindowBar],
     *, now: float | None = None,
 ) -> dict[str, Any] | None:
-    """Use the EXACT queued Kalshi settlement, never a Coinbase substitute.
+    """Poll outstanding tickers fairly; only finalized results teach or pay.
 
-    Legacy pending entries retain their original proxy label and are identified
-    as such. New unaligned forecasts are research-only and skipped, not scored.
+    The queue outlives the one-hour delayed marker and is independent of the next
+    forecast slot. Polling is bounded so a backlog cannot consume the entry window.
     """
     explicit_now = now is not None
     now = time.time() if now is None else now
-    pending = state.get("pending")
-    if not pending:
-        return None
-    pending_timestamp = int(pending["bar_timestamp"])
-    expected_timestamp = pending_timestamp + INTERVAL_SECONDS
-    expected_close = expected_timestamp + INTERVAL_SECONDS
-    next_bar = next((b for b in bars if b.timestamp == expected_timestamp), None)
+    queue = _prepare_settlement_queue(state, now)
+    learned_keys = state["learned_settlements"]
     current_timestamp = bars[-1].timestamp if bars else int(now // INTERVAL_SECONDS) * INTERVAL_SECONDS - INTERVAL_SECONDS
-    source = pending.get("outcome_source", "coinbase_proxy")
-    skip_reason = None
-    if source == "kalshi_official":
+    outcomes = []
+    lookups = 0
+    ordered = sorted(queue.items(), key=lambda item: (
+        bool(item[1].get("reconcile_only")), item[1].get("settlement_checked_at", 0), item[1]["bar_timestamp"]))
+    for key, pending in ordered:
+        if key in learned_keys:
+            queue.pop(key)
+            continue
+        pending_timestamp = int(pending["bar_timestamp"])
+        expected_timestamp = pending_timestamp + INTERVAL_SECONDS
+        expected_close = expected_timestamp + INTERVAL_SECONDS
         if now < expected_close:
-            return None
-        ticker = pending.get("market_ticker")
-        if any(t.get("market_ticker") == ticker and t.get("outcome_source") == source
-               for t in state.get("paper_trades") or []):
-            state["pending"] = None
-            return {"status": "already_learned", "bar_timestamp": pending_timestamp}
-        settled = None
-        try:
-            settled = fetch_kalshi_market_by_ticker(str(ticker))
-        except (OSError, ValueError, RuntimeError):
-            pending["settlement_status"] = "exact-market result unavailable; no proxy fill"
-        if (settled and settled.get("ticker") == ticker and settled.get("result") in {"yes", "no"}
-                and timestamp_seconds(settled.get("close_time")) == expected_close
-                and timestamp_seconds(pending.get("market_close_time")) == expected_close):
+            continue
+        next_bar = next((b for b in bars if b.timestamp == expected_timestamp), None)
+        source = pending.get("outcome_source", "coinbase_proxy")
+        skip_reason = None
+        if source == "kalshi_official":
+            if lookups >= MAX_SETTLEMENT_LOOKUPS_PER_CYCLE or now < pending.get("settlement_next_check_at", 0):
+                continue
+            lookups += 1
+            settled = None
+            try:
+                settled = fetch_kalshi_market_by_ticker(str(pending.get("market_ticker")))
+            except (OSError, ValueError, RuntimeError):
+                pass  # preserve the original forecast and retry; never substitute a proxy
+            observed = now if explicit_now else time.time()
+            delayed = observed >= expected_close + MAX_SETTLEMENT_DELAY_SECONDS
+            pending["settlement_checked_at"] = observed
+            pending["settlement_next_check_at"] = observed + (DELAYED_SETTLEMENT_RETRY_SECONDS if delayed else SETTLEMENT_RETRY_SECONDS)
+            pending["settlement_status"] = "delayed; retrying finalized result" if delayed else "waiting for finalized result"
+            if settled:
+                _remember_settlement(pending, settled, observed)
+            if (not is_finalized_result(settled, pending.get("market_ticker"), expected_close, observed)
+                    or timestamp_seconds(pending.get("market_close_time")) != expected_close):
+                continue
             label = int(settled["result"] == "yes")
             pending["official_expiration_value"] = optional_number(settled.get("expiration_value"))
             pending["official_result_snapshot"] = dict(settled)
-            pending["settled_at"] = now if explicit_now else time.time()  # response received, not request start
+            pending["settled_at"] = observed
+        elif source == "unmatched_research":
+            skip_reason = "forecast_not_bound_to_exact_Kalshi_interval"
+        elif next_bar is None:
+            if current_timestamp < expected_close:
+                continue
+            skip_reason = "next_bar_unavailable_or_out_of_window"
         else:
-            pending["settlement_status"] = "waiting for exact-market official settlement; no proxy fill"
-            if now < expected_close + MAX_SETTLEMENT_DELAY_SECONDS:
-                return None
-            skip_reason = "official_settlement_unavailable_or_misaligned"
-    elif source == "unmatched_research":
-        if now < expected_close:
-            return None
-        skip_reason = "forecast_not_bound_to_exact_Kalshi_interval"
-    elif next_bar is None:
-        if current_timestamp < expected_close:
-            return None
-        skip_reason = "next_bar_unavailable_or_out_of_window"
-    else:
-        label = int(next_bar.close >= float(pending["close"]))
-        pending["outcome_source"] = "coinbase_proxy"
+            label = int(next_bar.close >= float(pending["close"]))
+            pending["outcome_source"] = "coinbase_proxy"
 
-    if skip_reason:
-        if pending.get("trade_signal") == "TRADE" and int(pending.get("demo_quantity") or 0) > 0:
-            # A missing official label is NOT a cancelled fill or free money.
-            state.setdefault("unresolved_demo_trades", []).append(dict(pending))
-        skipped = {"bar_timestamp": pending_timestamp, "market_ticker": pending.get("market_ticker"),
-                   "reason": skip_reason, "recovered_at_bar": current_timestamp}
-        state.setdefault("skipped_predictions", []).append(skipped)
-        state["skipped_predictions"] = state["skipped_predictions"][-500:]
-        state["pending"] = None
-        state["last_learning_status"] = "recovered_skip"
-        return {"status": "skipped_stale", **skipped}
+        if skip_reason:
+            if _committed_entry(pending) and not any(_settlement_key(record) == key
+                                                     for record in state.get("unresolved_demo_trades") or []):
+                state.setdefault("unresolved_demo_trades", []).append(dict(pending))
+            skipped = {"bar_timestamp": pending_timestamp, "market_ticker": pending.get("market_ticker"),
+                       "reason": skip_reason, "recovered_at_bar": current_timestamp}
+            state.setdefault("skipped_predictions", []).append(skipped)
+            state["skipped_predictions"] = state["skipped_predictions"][-500:]
+            state["last_learning_status"] = "recovered_skip"
+            queue.pop(key)
+            outcomes.append({"status": "skipped_stale", **skipped})
+            continue
 
-    prior_probability = model.update([float(v) for v in pending["features"]], label)
-    paper_trade = settle_demo_trade(pending, label, next_bar)
-    demo_trade = settle_demo_account(state, pending, label, next_bar)
-    state.setdefault("paper_trades", []).append(paper_trade)
-    state["paper_trades"] = state["paper_trades"][-500:]
-    state["pending"] = None
-    state["last_learned_bar"] = expected_timestamp
-    state["last_learning_status"] = "learned"
-    return {"bar_timestamp": pending_timestamp, "label": label, "outcome": "UP" if label else "DOWN",
-            "outcome_source": pending["outcome_source"], "market_ticker": pending.get("market_ticker"),
-            "probability_before_update": prior_probability, "paper_trade": paper_trade, "demo_trade": demo_trade}
+        reconcile = pending.get("reconcile_only", False)
+        prior_probability = None
+        if not reconcile:
+            prior_probability = model.update([float(v) for v in pending["features"]], label)
+        paper_trade = settle_demo_trade(pending, label, next_bar)
+        if reconcile:
+            demo_trade = _reconcile_legacy_settlement(state, pending, label)
+            scores = state.setdefault("paper_trades", [])
+            existing = next((i for i, score in enumerate(scores) if _settlement_key(score) == key), None)
+            if existing is not None:
+                scores[existing] = paper_trade
+            else:
+                scores.append(paper_trade)
+        else:
+            demo_trade = settle_demo_account(state, pending, label, next_bar)
+            state.setdefault("paper_trades", []).append(paper_trade)
+            state["last_learned_bar"] = max(state.get("last_learned_bar") or expected_timestamp, expected_timestamp)
+            state["last_learning_status"] = "learned"
+        state["paper_trades"] = state["paper_trades"][-500:]
+        learned_keys[key] = {"label": label, "available_at": pending.get("settled_at", now)}
+        queue.pop(key)
+        outcomes.append({"status": "reconciled" if reconcile else "learned",
+                         "bar_timestamp": pending_timestamp, "label": label, "outcome": "UP" if label else "DOWN",
+                         "outcome_source": pending["outcome_source"], "market_ticker": pending.get("market_ticker"),
+                         "probability_before_update": prior_probability, "paper_trade": paper_trade, "demo_trade": demo_trade})
+    state["unresolved_demo_trades"] = [record for record in state.get("unresolved_demo_trades") or []
+                                      if _settlement_key(record) not in learned_keys]
+    if not outcomes:
+        return None
+    return {**outcomes[-1], "settled_forecasts": outcomes} if len(outcomes) > 1 else outcomes[0]
 
 
 def bootstrap_from_bars(
@@ -1311,6 +1471,7 @@ def predict_and_queue(
 ) -> dict[str, Any]:
     """Freeze new forecasts with timely quotes; previews wait for market discovery."""
     now = time.time() if now is None else now
+    queue = _prepare_settlement_queue(state, now)
     if not bars:
         raise ValueError("no complete 15-minute bars available")
     current = bars[-1]
@@ -1337,9 +1498,9 @@ def predict_and_queue(
     historical_analysis = learning_analysis(state, {"bar_timestamp": current.timestamp, "trade_signal": "WAIT"}, now=now)
     signal["checks"]["risk_validation"] = historical_analysis["risk_gate"] == "ALLOW"
     signal["blockers"].extend(historical_analysis["blockers"])
-    signal["checks"]["pending_slot"] = not pending or same_forecast
+    signal["checks"]["pending_slot"] = (not pending or same_forecast) and not any(_committed_entry(record) for record in queue.values())
     if not signal["checks"]["pending_slot"]:
-        signal["blockers"].append("previous exact-market settlement still pending; no overlapping paper position")
+        signal["blockers"].append("an earlier paper position is still awaiting finalized settlement; no overlapping paper position")
     signal["checks"]["pending_contract"] = not pending.get("market_ticker") or pending.get("market_ticker") == (kalshi_market or {}).get("ticker")
     if not signal["checks"]["pending_contract"]:
         signal["blockers"].append("current quotes belong to a different ticker than the frozen forecast")
@@ -1415,6 +1576,7 @@ def predict_and_queue(
         "forecast_status": forecast_status,
         "forecast_issued_at": queued.get("forecast_issued_at") if current_queued else None,
         "forecast_entry_deadline": entry_deadline,
+        "settlement_queue_size": len(queue),
     }
     midpoint = optional_number((kalshi_market or {}).get("yes_mid"))
     prediction["model_minus_kalshi_yes"] = probability_up - midpoint if midpoint is not None else None
@@ -1494,7 +1656,8 @@ def finalize_prediction(
             pending["entry_market_snapshot"] = dict(market)
             pending["entry_signal_checks"] = dict(prediction.get("signal_checks") or {})
             pending["entry_review_fingerprint"] = prediction["review_input_fingerprint"]
-    prediction["open_paper_trade"] = bool(pending.get("trade_committed_at"))
+    prediction["open_paper_trade"] = bool(pending.get("trade_committed_at")) or any(
+        _committed_entry(record) for record in (state.get("settlement_queue") or {}).values())
     state["last_recommendation"] = {"action": prediction["trade_signal"], "bar_timestamp": prediction.get("bar_timestamp"),
                                      "market_ticker": market.get("ticker"), "decided_at": now, "blockers": blockers,
                                      "forecast_status": prediction.get("forecast_status"),
@@ -1539,8 +1702,13 @@ def command_train(args: argparse.Namespace) -> int:
 
 
 def command_run(args: argparse.Namespace) -> int:
-    bars = _load_bars(args)
     state_path = Path(args.state_file)
+    try:
+        bars = _load_bars(args)
+    except (RuntimeError, OSError, ValueError) as exc:
+        recovered = recover_settlements_without_prices(state_path)
+        print(json.dumps({"status": "awaiting_data", "error": str(exc), **recovered}, indent=2))
+        return 1
     kalshi_market = None
     kalshi_error = None
     try:
@@ -1561,7 +1729,19 @@ def command_run(args: argparse.Namespace) -> int:
             state["bootstrap_metrics"] = metrics
 
         state["typesafe_required"] = bool(state.get("typesafe_required") or (state.get("typesafe_review") or {}).get("enabled") or os.environ.get(TYPESAFE_API_KEY_ENV))
-        prediction = predict_and_queue(model, state, bars, kalshi_market)
+        try:
+            prediction = predict_and_queue(model, state, bars, kalshi_market)
+        except ValueError as exc:
+            # Valid finalizations survive a gap in feature history. Do not rerun
+            # learning against discarded in-memory state on every candle retry.
+            archive_and_guard(state_path, state, bars,
+                              raw_candles=getattr(args, "_archivable_candles", None),
+                              product_id=getattr(args, "product_id", DEFAULT_PRODUCT),
+                              prices_observed_at=getattr(args, "_prices_observed_at", None))
+            save_state(state_path, model, state)
+            print(json.dumps({"status": "awaiting_data", "error": str(exc), "learned_previous": learned,
+                              "demo_account": demo_account_summary(state)}, indent=2))
+            return 1
         review = typesafe_strategy_review(prediction, state)
         state["typesafe_review"] = review
         prediction = finalize_prediction(prediction, state, review)
@@ -1583,6 +1763,19 @@ def command_run(args: argparse.Namespace) -> int:
         }
     print(json.dumps(result, indent=2))
     return 0
+
+
+def recover_settlements_without_prices(state_path: str | Path) -> dict[str, Any]:
+    """A Coinbase outage must not stop independent exact-ticker settlement recovery."""
+    state_path = Path(state_path)
+    if not state_path.is_file():
+        return {"learned_previous": None}
+    with state_transaction(state_path):
+        model, state = load_state(state_path)
+        learned = learn_from_pending(model, state, [])
+        archive_and_guard(state_path, state, [])
+        save_state(state_path, model, state)
+        return {"learned_previous": learned, "demo_account": demo_account_summary(state)}
 
 
 def _add_common_options(parser: argparse.ArgumentParser, suppress_defaults: bool = False) -> None:
