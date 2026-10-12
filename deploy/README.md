@@ -54,6 +54,11 @@ sudo bash deploy/install.sh
 The installer stages files without starting the collector. Services require the
 existing state and archive, so migration cannot accidentally bootstrap a new run.
 
+The application runtime is dependency-free: Python's standard library and inline
+browser JavaScript/SVG. Optional Node.js on `PATH` enables the executable dashboard
+renderer/polling tests in the Python suite above; without Node, that test is
+explicitly skipped. Serving the dashboard requires neither Node nor npm packages.
+
 ## 3. Cut over with a consistent evidence snapshot
 
 Do this after installation is ready, preferably just after a forecast cycle to
@@ -257,14 +262,95 @@ Disable scheduled comparisons with
 The archive itself is not pruned by backup retention. Disk usage can be checked with
 `df -h /var/lib/kalshi` and `du -sh /var/lib/kalshi/backups`.
 
+### Historical analytics operations
+
+The **Historical analytics** panel is below **Context horizon comparison** and
+above **Previous market settlement** and the metric cards. Its read-only endpoints
+use the configured state-file stem to locate existing evidence. With the installed
+service defaults, these are:
+
+- `/var/lib/kalshi/btc_15m_state_archive.sqlite3`: recent frozen official forecasts
+  and rolling trend, opened with SQLite `mode=ro` and connection-local `query_only`.
+- `/var/lib/kalshi/btc_15m_state_validation_summary.json`: saved report-wide forward
+  metrics, walk-forward progress, collection coverage, and report generation time.
+
+The endpoints perform no network collection, report generation, model updates, or
+application writes to state/archive/report evidence, and do not create or migrate
+a missing database. Native SQLite **WAL/SHM coordination sidecars may be created
+or updated**, and sorting may use temporary files. This is read-only SQL, not a
+promise of unchanged SHM metadata or zero filesystem mutation. Keep `mode=ro` and
+`query_only`; do not use `immutable=1`, which would break live WAL visibility.
+They can be read independently of live-price API availability. On the VM, or
+through the SSH tunnel, inspect them with:
+
+```bash
+curl --fail http://127.0.0.1:8765/api/analytics
+curl --fail 'http://127.0.0.1:8765/api/analytics/forecasts?limit=25'
+```
+
+`GET /api/analytics` includes at most the newest 25 trend points, in chronological
+order. `GET /api/analytics/forecasts` defaults to 25 rows, newest first, with the
+earliest eligible forecast selected per ticker. Its explicit `limit` must be a
+decimal integer **1–25**; blank, signed, fractional, nonnumeric, or out-of-range
+values return **HTTP 400**, `{"error":"invalid analytics limit"}`, rather than
+being clamped. Missing evidence and unavailable inputs return HTTP 200 with a
+`pending` or `unavailable` status, so check the JSON status as well as HTTP success.
+
+Missing archive/summary files are **pending**; unreadable/corrupt archives and
+malformed, contradictory, or future-dated summaries are **unavailable**. The panel
+clears report metrics/coverage to unknown (`—`), never zero-filled success. A
+readable archive can still supply its trend and independent recent table while
+the report is pending/unavailable. An available empty table means no eligible
+archived forecasts. The runner's existing startup/daily evaluation generates the
+saved validation summary; analytics requests do not trigger it.
+
+A valid report **older than 36 hours** remains `status="available"`, retaining
+diagnostic statistics with `report_freshness="stale"`,
+`freshness.diagnostic_only=true`, and the UI's **Stale report — diagnostic-only**
+warning. Available analytics reports have `validation_ready=false`, even when fresh.
+Report update time/age and report-wide coverage are separate from live archive
+window-end issue times and the recent table's browser refresh (**Archive read**)
+time. All displayed timestamps are UTC; refreshing the page does not refresh the
+saved report.
+
+Both endpoints reuse one bounded in-process archive cache: **four paths**, **10-second
+TTL** (including safe failures), with database/nonempty-WAL device/inode/size/mtime/ctime
+identity checked on every request. Empty and absent WALs are equivalent; SHM read
+marks are excluded. Changed sources invalidate reuse; changes during a scan discard
+its result. `archive_read_at` is the scan-completion Unix timestamp, separate from
+browser refresh and saved-report freshness. The saved report is projected afresh.
+
+Only **one analytics scan per process** runs at a time, using its own lock, with a
+**250-ms** maximum wait for other analytics callers. It never takes the live
+prediction/state lock. Scan limits are **1 second** (cooperative), **5,000,000 SQLite
+VM steps**, **100-ms busy timeout**, **50,000 candidate rows**, **25,000 eligible
+tickers**, **16 MiB decoded field bytes**, and **64 KiB per SQLite record/value**.
+Only the newest **149 canonical rows** are retained; newest-25 trend windows keep
+global 25-record/stride-5 alignment even for `limit=1`. All candidates, including
+duplicates, count toward scan budgets. SQLite uses a 2-MiB page-cache target and
+file-backed sorting. Exhaustion returns safe unavailable with empty archive
+rows/trend and cleared metrics, never partial-population success. Persistent
+over-budget archives need a future maintained summary or reviewed budget change;
+filesystem/scheduling stalls can exceed the cooperative deadline. Exact semantics
+and freshness distinctions are documented in the main README.
+
+See [reading historical analytics](../README.md#historical-analytics) for the
+distinct forward eligible, forward scored, and walk-forward scored populations.
+The trend uses 25-record windows, stride 5, and at least 10 valid official labels
+with usable probabilities per score; missing scores break lines. Coverage
+categories may overlap. **Descriptive archived evidence; not profitability proof.**
+Charts show forecast scores, not profit, and never authorize paper entries.
+
 ## 6. GitHub Actions CI/CD
 
 ### CI
 
 The `CI` workflow runs automatically on pushes and pull requests. It executes the
 unit suite, Python compilation checks, shell syntax checks, and code-bundle
-inspection on Python 3.11 and 3.12. It never connects to the Oracle VM and never
-needs production credentials.
+inspection on Python 3.11 and 3.12. CI and deployment builds install/check Node 24
+for the executable renderer tests and syntax-check **each** deployment shell script.
+There is no npm install/build or Node runtime dependency. CI never connects to the
+Oracle VM and never needs production credentials.
 
 ### Configure the production environment
 
@@ -306,6 +392,14 @@ then pauses for approval in the `production` environment. After approval, it:
 Routine releases do not copy local state or SQLite files to the VM. Initial
 migration and an intentional move of collection between machines still use the
 consistent snapshot procedure in section 3 and must leave only one active runner.
+
+Historical analytics can be rolled out to an existing Oracle installation through
+this same **code-only** workflow using `bash deploy/package.sh`; it needs no state
+or archive migration, schema change, or new service/timer. Existing archive and
+validation-summary files supply its evidence. After a release, use the two
+analytics requests above and inspect the panel to verify availability and
+freshness. These are rollout instructions, not confirmation that historical
+analytics has been deployed to Oracle.
 
 Inspect a release with:
 

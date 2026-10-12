@@ -8,9 +8,10 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import forecast_archive
-from dashboard import DashboardApp, DashboardHandler
+from dashboard import HTML, DashboardApp, DashboardHandler
 
 
 def metrics(count, brier, loss, accuracy):
@@ -45,6 +46,24 @@ def report():
 
 
 class DashboardContextTests(unittest.TestCase):
+    def test_analytics_markup_is_semantic_and_between_context_and_settlement(self):
+        self.assertIn('id="historical-analytics"', HTML)
+        section = HTML.split('id="historical-analytics"', 1)[1].split(
+            '<article class="card settled">', 1)[0]
+        self.assertLess(HTML.index('id="context-title"'), HTML.index('id="historical-analytics"'))
+        self.assertIn('aria-labelledby="analytics-title"', section)
+        self.assertIn('<h2 id="analytics-title">Historical analytics</h2>', section)
+        for hook in ("status", "summary", "trend", "coverage", "forecasts", "note"):
+            self.assertIn(f'id="analytics-{hook}"', section)
+        self.assertIn('<caption>', section)
+        self.assertIn('scope="col"', section)
+        self.assertIn('tabindex="0"', section)
+        self.assertIn('role="status"', section)
+        self.assertIn('unavailable', section)
+        self.assertIn('Descriptive archived evidence; not profitability proof.', section)
+        self.assertNotIn('<button', section)
+        self.assertNotIn('TRADE NOW', section)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -54,6 +73,35 @@ class DashboardContextTests(unittest.TestCase):
 
     def write_report(self, value=None):
         self.comparison.write_text(json.dumps(report() if value is None else value), encoding="utf-8")
+
+    def get_json(self, path):
+        class QuietHandler(DashboardHandler):
+            app = DashboardApp(str(self.state), 1440)
+
+            def log_message(self, *unused):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}{path}", timeout=5) as response:
+                    return response.status, json.load(response)
+            except HTTPError as error:
+                try:
+                    body = error.read()
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError:
+                        payload = body.decode("utf-8")
+                    return error.code, payload
+                finally:
+                    error.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
 
     def test_saved_report_exposes_distinct_full_and_quote_matched_metrics(self):
         self.write_report()
@@ -149,6 +197,150 @@ class DashboardContextTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             worker.join(timeout=5)
+
+    def test_analytics_api_returns_compact_payload_without_network_calls(self):
+        expected = {
+            "status": "available",
+            "summary": {"scored_count": 10},
+            "trend": [{"count": 10}],
+            "coverage": {"timely": 10},
+        }
+        with patch("dashboard.read_historical_analytics", return_value=expected) as reader:
+            with patch("dashboard.fetch_candles", side_effect=AssertionError("analytics fetched live prices")):
+                status, payload = self.get_json("/api/analytics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, expected)
+        reader.assert_called_once_with(self.state)
+
+    def test_forecasts_api_returns_requested_bounded_rows_without_network_calls(self):
+        rows = [{"forecast_id": str(index)} for index in range(25)]
+
+        def recent_forecasts(state_file, limit):
+            self.assertEqual(state_file, self.state)
+            return {"status": "available", "rows": rows[:limit]}
+
+        with patch("dashboard.read_recent_forecasts", side_effect=recent_forecasts) as reader:
+            with patch("dashboard.fetch_candles", side_effect=AssertionError("analytics fetched live prices")):
+                status, payload = self.get_json("/api/analytics/forecasts?limit=25")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["rows"]), 25)
+        self.assertEqual(payload["rows"][0]["forecast_id"], "0")
+        reader.assert_called_once_with(self.state, 25)
+
+    def test_invalid_forecast_limits_return_safe_json_400(self):
+        for limit in ("0", "26", "not-a-number", "1.5"):
+            with self.subTest(limit=limit):
+                status, payload = self.get_json(f"/api/analytics/forecasts?limit={limit}")
+                self.assertEqual(status, 400)
+                self.assertEqual(payload, {"error": "invalid analytics limit"})
+
+    def test_analytics_api_normalizes_sensitive_saved_report_reasons(self):
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        validation_summary = forecast_archive.validation_paths(self.state)[1]
+        sensitive_text = (
+            "/private/analytics/state.json", "token=synthetic-test-secret",
+            "Traceback (most recent call last)",
+        )
+        for report_status, public_reason in (
+            ("pending", "Awaiting historical analytics evidence."),
+            ("unavailable", "Historical analytics are unavailable."),
+        ):
+            with self.subTest(status=report_status):
+                validation_summary.write_text(json.dumps({
+                    "status": report_status, "reason": "\n".join(sensitive_text),
+                }), encoding="utf-8")
+                status, payload = self.get_json("/api/analytics")
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], report_status)
+                self.assertFalse(payload["validation_ready"])
+                serialized = json.dumps(payload, allow_nan=False)
+                for text in sensitive_text:
+                    self.assertNotIn(text, serialized)
+                self.assertEqual(payload["reason"], public_reason)
+
+    def test_missing_or_malformed_analytics_reports_are_safe_and_read_only(self):
+        status, payload = self.get_json("/api/analytics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "pending")
+        status, payload = self.get_json("/api/analytics/forecasts?limit=25")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "pending")
+        self.assertFalse(self.state.exists())
+        self.assertFalse(forecast_archive.archive_path(self.state).exists())
+
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)) as connection:
+            for index in range(3):
+                bar_timestamp = 1800000000 + index * 900
+                issued_at = bar_timestamp + 960
+                connection.execute("""INSERT INTO forecasts (
+                    forecast_id, state_id, bar_timestamp, market_ticker,
+                    forecast_issued_at, probability_up, validation_eligible,
+                    outcome_source, provenance, captured_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)""", (
+                    f"forecast-{index}", "test-state", bar_timestamp, f"ticker-{index}",
+                    issued_at, .6, 1, "kalshi_official", "live_archive", issued_at,
+                ))
+        self.state.write_bytes(b"existing-live-state")
+        validation_summary = forecast_archive.validation_paths(self.state)[1]
+        validation_summary.write_bytes(b"{ malformed")
+        paths = (self.state, forecast_archive.archive_path(self.state), validation_summary)
+        before = {path: path.read_bytes() for path in paths}
+        status, payload = self.get_json("/api/analytics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertFalse(payload["validation_ready"])
+        self.assertNotIn("traceback", json.dumps(payload).lower())
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+        status, payload = self.get_json("/api/analytics/forecasts?limit=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "available")
+        self.assertEqual([row["forecast_id"] for row in payload["rows"]],
+                         ["forecast-2", "forecast-1"])
+        for row in payload["rows"]:
+            self.assertEqual(row["probability_up"], .6)
+            self.assertEqual(row["timing_status"], "unknown")
+            self.assertFalse(row["market_midpoint_available"])
+            for key in ("result", "yes_mid", "settlement_available_at", "settlement_delay_seconds"):
+                self.assertIsNone(row[key])
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+    def test_contradictory_scored_populations_and_empty_wilson_clear_api_metrics(self):
+        from test_historical_analytics import HistoricalAnalyticsTests
+
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        invalid_walk = HistoricalAnalyticsTests.validation_summary(
+            scored_count=10, eligible_count=35, walk_scored_count=11)
+        invalid_interval = HistoricalAnalyticsTests.validation_summary(scored_count=0, eligible_count=35)
+        invalid_interval["forward"]["metrics"]["accuracy_wilson_95"] = {"lower": 0, "upper": 1}
+        for report in (invalid_walk, invalid_interval):
+            with self.subTest(report=report):
+                forecast_archive.validation_paths(self.state)[1].write_text(json.dumps(report))
+                status, payload = self.get_json("/api/analytics")
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], "unavailable")
+                self.assertFalse(payload["validation_ready"])
+                self.assertTrue(all(value is None for value in payload["summary"].values()))
+                self.assertTrue(all(value is None for value in payload["walk_forward"].values()))
+                self.assertTrue(all(value is None for value in payload["coverage"].values()))
+                self.assertNotIn(str(self.directory), json.dumps(payload, allow_nan=False))
+
+    def test_budget_failure_is_safe_at_both_http_endpoints(self):
+        with forecast_archive.connect_archive(forecast_archive.archive_path(self.state)):
+            pass
+        with patch("forecast_archive.ARCHIVE_SCAN_SECONDS", 0):
+            for endpoint, collection in (("/api/analytics", "trend"),
+                                         ("/api/analytics/forecasts?limit=1", "rows")):
+                status, payload = self.get_json(endpoint)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["status"], "unavailable")
+                self.assertEqual(payload[collection], [])
+                if "summary" in payload:
+                    self.assertTrue(all(value is None for value in payload["summary"].values()))
+                    self.assertFalse(payload["validation_ready"])
+                self.assertNotIn(str(self.directory), json.dumps(payload, allow_nan=False))
 
 
 if __name__ == "__main__":

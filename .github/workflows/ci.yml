@@ -21,14 +21,24 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Require Node for renderer tests
+        run: node --version
+
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
       - name: Compile Python modules
-        run: python -m compileall -q *.py tests
+        run: python -m compileall -q ./*.py tests
 
       - name: Check shell syntax
-        run: bash -n deploy/*.sh
+        run: |
+          for script in deploy/*.sh; do
+            bash -n "$script" || exit 1
+          done
 
       - name: Build code-only bundle
         run: bash deploy/package.sh
