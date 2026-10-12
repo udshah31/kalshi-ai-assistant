@@ -11,6 +11,7 @@ from btc_predictor import (
     finalize_prediction, archive_and_guard, learning_analysis,
 )
 from forecast_archive import archive_path, record_cycle
+from finalized_fixtures import finalized_history, finalized_snapshot
 
 START = 1800000000
 NOW = START + 60
@@ -32,7 +33,7 @@ def pending():
 
 def settled(record):
     return {**record, "outcome": "UP", "correct": True, "settled_at": START+905,
-            "official_result_snapshot": {"ticker": record["market_ticker"], "close_time": START+900, "result": "yes"}}
+            "official_result_snapshot": finalized_snapshot(record["market_ticker"], START+900)}
 
 
 class ForecastArchiveTests(unittest.TestCase):
@@ -159,9 +160,7 @@ class ForecastArchiveTests(unittest.TestCase):
         model = OnlineLogisticRegression(7)
         self.state = new_state(model)
         self.state["last_learned_bar"] = BAR
-        self.state["paper_trades"] = [{"market_ticker": f"historical-{i}", "probability_up": .8,
-                                      "outcome_source": "kalshi_official", "correct": True, "outcome": "UP"}
-                                     for i in range(100)]
+        self.state["paper_trades"] = finalized_history(bar=BAR, prefix="historical-")
         with patch("btc_predictor.feature_vector", return_value=pending()["features"]), patch.object(model, "predict_proba", return_value=.8):
             prediction = predict_and_queue(model, self.state, [WindowBar(BAR,100,101,99,100,1)], pending()["market_snapshot"], now=NOW)
         result = finalize_prediction(prediction, self.state, {"enabled": False, "status": "disabled"}, now=NOW)

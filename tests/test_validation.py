@@ -12,6 +12,7 @@ from unittest import mock
 
 import validation
 from btc_predictor import FEATURE_NAMES
+from finalized_fixtures import finalized_snapshot
 
 
 SCHEMA = """
@@ -92,7 +93,7 @@ class ValidationTests(unittest.TestCase):
                 "forecast_id": values["forecast_id"], "market_ticker": values["market_ticker"],
                 "market_close_time": bar + 1800, "result": "yes" if label else "no",
                 "available_at": bar + 1810, "outcome_source": "kalshi_official",
-                "snapshot_json": json.dumps({"ticker": values["market_ticker"], "open_time": bar + 900, "close_time": bar + 1800, "result": "yes" if label else "no"}),
+                "snapshot_json": json.dumps(finalized_snapshot(values["market_ticker"], bar + 1800, "yes" if label else "no")),
                 "provenance": "first local observation",
             }
             result.update(settlement_changes or {})
@@ -297,7 +298,7 @@ class ValidationTests(unittest.TestCase):
         self.series(16)
         before = self.evaluate(train_size=3, calibration_size=2, test_size=2)["walk_forward"]
         for index in range(9, 16):
-            self.update("settlements", f"f{index}", result="no", snapshot_json=json.dumps({"ticker": f"BTC-{index}", "result": "no"}))
+            self.update("settlements", f"f{index}", result="no", snapshot_json=json.dumps(finalized_snapshot(f"BTC-{index}", market(index)["close_time"], "no")))
         after = self.evaluate(train_size=3, calibration_size=2, test_size=2)["walk_forward"]
         for index in (0, 1):
             self.assertEqual(before["folds"][index], after["folds"][index])
@@ -311,14 +312,14 @@ class ValidationTests(unittest.TestCase):
         self.series(9)
         before = self.evaluate(train_size=3, calibration_size=2, test_size=2)["walk_forward"]["folds"][0]
         for index in (5, 6):
-            self.update("settlements", f"f{index}", result="no", snapshot_json=json.dumps({"result": "no"}))
+            self.update("settlements", f"f{index}", result="no", snapshot_json=json.dumps(finalized_snapshot(f"BTC-{index}", market(index)["close_time"], "no")))
         test_changed = self.evaluate(train_size=3, calibration_size=2, test_size=2)["walk_forward"]["folds"][0]
         self.assertEqual(before["calibration_fit"], test_changed["calibration_fit"])
         for old, new in zip(before["predictions"], test_changed["predictions"]):
             self.assertEqual(old["raw_probability_up"], new["raw_probability_up"])
             self.assertEqual(old["calibrated_probability_up"], new["calibrated_probability_up"])
         for index in (3, 4):
-            self.update("settlements", f"f{index}", result="no", snapshot_json=json.dumps({"result": "no"}))
+            self.update("settlements", f"f{index}", result="no", snapshot_json=json.dumps(finalized_snapshot(f"BTC-{index}", market(index)["close_time"], "no")))
         calibration_changed = self.evaluate(train_size=3, calibration_size=2, test_size=2)["walk_forward"]["folds"][0]
         self.assertNotEqual(before["calibration_fit"], calibration_changed["calibration_fit"])
         for old, new in zip(before["predictions"], calibration_changed["predictions"]):

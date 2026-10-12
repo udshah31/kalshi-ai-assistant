@@ -20,6 +20,7 @@ from dashboard import DashboardApp
 from forecast_archive import archive_path, record_cycle
 from live_runner import recommendation_needs_retry, run_session
 from validation import evaluate_archive
+from finalized_fixtures import finalized_snapshot
 
 START = 1800000000
 BAR = START-900
@@ -43,10 +44,6 @@ class ForecastTimingTests(unittest.TestCase):
         self.model.bias = math.log(4)
         self.state = new_state(self.model)
         self.state["last_learned_bar"] = BAR
-        self.state["paper_trades"] = [
-            {"market_ticker": f"history-{i}", "outcome_source": "kalshi_official",
-             "probability_up": .8, "outcome": "UP", "correct": True} for i in range(100)
-        ]
         self.bars = [WindowBar(BAR-(21-i)*900, 100+i, 101+i, 99+i, 100+i, 100)
                      for i in range(22)]
 
@@ -84,8 +81,7 @@ class ForecastTimingTests(unittest.TestCase):
         self.assertEqual(len(self.rows("forecasts")), 1)
         self.state["paper_trades"].append({
             **pending, "outcome": "UP", "correct": True, "settled_at": START+905,
-            "official_result_snapshot": {"ticker": market(START+41)["ticker"],
-                                         "close_time": START+900, "result": "yes"},
+            "official_result_snapshot": finalized_snapshot(market(START+41)["ticker"], START+900),
         })
         self.state["pending"] = None
         record_cycle(self.archive, self.state, now=START+905)
@@ -152,13 +148,15 @@ class ForecastTimingTests(unittest.TestCase):
         self.predict(START+70, quotes)
         self.assertEqual(self.state["pending"], original)
 
-    def test_previous_unsettled_forecast_is_preserved(self):
+    def test_previous_unsettled_forecast_moves_to_queue_and_collection_continues(self):
         self.state["pending"] = {"bar_timestamp": BAR-900, "market_ticker": "older-ticker",
                                  "probability_up": .8, "forecast_issued_at": START-850,
                                  "outcome_source": "kalshi_official"}
         original = copy.deepcopy(self.state["pending"])
         result = self.predict(START+10, market(START+10))
-        self.assertEqual(self.state["pending"], original)
+        self.assertEqual(self.state["settlement_queue"]["older-ticker"], original)
+        self.assertEqual(self.state["pending"]["bar_timestamp"], BAR)
+        self.assertEqual(result["forecast_status"], "issued")
         self.assertEqual(result["trade_signal"], "WAIT")
         self.assertTrue(recommendation_needs_retry(result, START+10))
 

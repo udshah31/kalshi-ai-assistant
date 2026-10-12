@@ -7,6 +7,7 @@ from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from finalized_fixtures import finalized_history, finalized_snapshot
 
 from btc_predictor import (
     FEATURE_NAMES, INTERVAL_SECONDS, MIN_LIVE_SAMPLES, OnlineLogisticRegression,
@@ -90,17 +91,24 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(validation["ready"])
         self.assertEqual(validation["minimum_samples"], MIN_LIVE_SAMPLES)
 
+    def test_provisional_history_cannot_authorize_account_entries(self):
+        history = finalized_history(100, bar=BAR)
+        for score in history:
+            score["official_result_snapshot"].update({"status": "determined", "settlement_time": None})
+        result = official_validation({"paper_trades": history})
+        self.assertEqual(result["samples"], 0)
+        self.assertFalse(result["ready"])
+
     def test_new_forecast_uses_official_result_even_if_coinbase_disagrees(self):
         model = OnlineLogisticRegression(len(FEATURE_NAMES)); state = new_state(model)
         state["pending"] = {
             "bar_timestamp": BAR, "close": 100., "features": FEATURES,
             "probability_up": .8, "demo_side": "UP", "trade_signal": "WAIT",
             "market_ticker": "KXBTC15M-example", "market_close_time": START+900,
-            "outcome_source": "kalshi_official",
+            "outcome_source": "kalshi_official", "forecast_issued_at": NOW,
         }
         bars = [WindowBar(START, 100., 110., 99., 110., 100.)]
-        settled = {"ticker": "KXBTC15M-example", "close_time": START+900,
-                   "result": "no", "expiration_value": "99.00"}
+        settled = {**finalized_snapshot("KXBTC15M-example", START+900, "no"), "expiration_value": "99.00"}
         with patch("btc_predictor.fetch_kalshi_market_by_ticker", return_value=settled):
             result = learn_from_pending(model, state, bars, now=START+910)
         self.assertEqual(result["outcome"], "DOWN")
@@ -116,7 +124,7 @@ class RecommendationTests(unittest.TestCase):
                             "market_close_time": START+900, "outcome_source": "kalshi_official"}
         with patch("btc_predictor.fetch_kalshi_market_by_ticker", return_value={"result": ""}):
             self.assertIsNone(learn_from_pending(model, state, [WindowBar(START, 100, 110, 99, 110, 100)], now=START+910))
-        self.assertIsNotNone(state["pending"])
+        self.assertIn("KXBTC15M-example", state["settlement_queue"])
         self.assertEqual(model.updates, 0)
         self.assertEqual(len(state["paper_trades"]), 0)
 
@@ -130,9 +138,7 @@ class RecommendationTests(unittest.TestCase):
 
     def strong_candidate(self):
         model = OnlineLogisticRegression(len(FEATURE_NAMES)); state = new_state(model)
-        state["paper_trades"] = [{"market_ticker": f"KXBTC15M-history-{i}", "outcome_source": "kalshi_official",
-                                  "correct": True, "probability_up": .8, "outcome": "UP"}
-                                 for i in range(MIN_LIVE_SAMPLES)]
+        state["paper_trades"] = finalized_history(MIN_LIVE_SAMPLES, bar=BAR, prefix="KXBTC15M-history-")
         state["last_learned_bar"] = BAR
         with patch("btc_predictor.feature_vector", return_value=FEATURES), patch.object(model, "predict_proba", return_value=.8):
             prediction = predict_and_queue(model, state, [WindowBar(BAR, 100, 101, 99, 100, 100)], market(), now=NOW)
@@ -192,7 +198,7 @@ class RecommendationTests(unittest.TestCase):
     def test_official_labels_do_not_require_coinbase_target_bar(self):
         model, state, prediction = self.strong_candidate()
         finalize_prediction(prediction, state, {"enabled": False, "status": "disabled"}, now=NOW)
-        settled = {"ticker": market()["ticker"], "close_time": START+900, "result": "yes", "expiration_value": "105"}
+        settled = {**finalized_snapshot(market()["ticker"], START+900), "expiration_value": "105"}
         with patch("btc_predictor.fetch_kalshi_market_by_ticker", return_value=settled):
             result = learn_from_pending(model, state, [], now=START+920)
         self.assertEqual(result["outcome"], "UP")
@@ -203,14 +209,15 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(model.updates, updates)
         self.assertEqual(state["demo_account"]["balance"], balance)
 
-    def test_missing_or_wrong_official_result_recovers_without_fake_label(self):
+    def test_missing_or_wrong_official_result_remains_retryable_without_fake_label(self):
         for result in ({"result": "yes", "ticker": "wrong", "close_time": START+900},
                        {"result": "yes", "ticker": market()["ticker"], "close_time": START+1800}):
             model, state, _ = self.strong_candidate()
             with patch("btc_predictor.fetch_kalshi_market_by_ticker", return_value=result):
                 learned = learn_from_pending(model, state, [], now=START+900+3601)
-            self.assertEqual(learned["status"], "skipped_stale")
+            self.assertIsNone(learned)
             self.assertIsNone(state["pending"])
+            self.assertIn(market()["ticker"], state["settlement_queue"])
             self.assertEqual(model.updates, 0)
             self.assertEqual(state["demo_account"]["balance"], 100)
 
@@ -219,12 +226,12 @@ class RecommendationTests(unittest.TestCase):
         finalize_prediction(prediction, state, {"enabled": False, "status": "disabled"}, now=NOW)
         with patch("btc_predictor.fetch_kalshi_market_by_ticker", return_value={"result": ""}):
             learned = learn_from_pending(model, state, [], now=START+900+3601)
-        self.assertEqual(learned["status"], "skipped_stale")
-        self.assertEqual(len(state["unresolved_demo_trades"]), 1)
-        self.assertGreater(state["unresolved_demo_trades"][0]["demo_cost"], 0)
+        self.assertIsNone(learned)
+        self.assertEqual(len(state["settlement_queue"]), 1)
+        self.assertGreater(state["settlement_queue"][market()["ticker"]]["demo_cost"], 0)
         self.assertEqual(state["demo_account"]["trades"], 0)
         self.assertEqual(state["demo_account"]["realized_pnl"], 0)
-        self.assertTrue(any("unresolved committed" in b for b in learning_analysis(state, now=START+4501)["blockers"]))
+        self.assertTrue(any("awaiting finalized" in b for b in learning_analysis(state, now=START+4501)["blockers"]))
 
     def test_wall_clock_freshness_detects_no_progress(self):
         state = {"pending": {"bar_timestamp": BAR-900*8}, "last_learned_bar": BAR-900*9}
@@ -244,7 +251,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(aggregate_candles(candles), [])
 
     def test_late_and_duplicate_samples_do_not_manufacture_validation(self):
-        trade = {"market_ticker": "ticker", "outcome_source": "kalshi_official", "correct": True, "probability_up": .8, "outcome": "UP"}
+        trade = finalized_history(1, bar=BAR)[0]
         self.assertEqual(official_validation({"paper_trades": [trade, trade]})["samples"], 1)
         self.assertEqual(official_validation({"paper_trades": [{**trade, "validation_eligible": False}]})["samples"], 0)
 
@@ -309,6 +316,7 @@ class RecommendationTests(unittest.TestCase):
         _, state, _ = self.strong_candidate()
         for trade in state["paper_trades"][:40]:
             trade.update({"outcome": "DOWN", "correct": False})
+            trade["official_result_snapshot"]["result"] = "no"
         validation = official_validation(state)
         self.assertGreater(validation["accuracy"], .5)
         self.assertGreater(validation["brier"], .25)

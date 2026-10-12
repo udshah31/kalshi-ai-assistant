@@ -18,10 +18,14 @@ or manage real money.
 4. `run` selects the currently open BTC 15-minute contract and fetches its public
    orderbook. Its open/close interval must match the forecast exactly.
 5. New matched forecasts persist the ticker, interval, issue time, original
-   probability, features, and market snapshot. When that exact ticker has an official
-   YES/NO result, it supplies the new online label and paper-account settlement.
-   If the result is unavailable, the app waits and retries rather than substituting
-   Coinbase's next close. It skips unresolved settlements after one hour.
+   probability, features, and market snapshot. That exact ticker must reach
+   **`finalized`**, with a valid exchange settlement timestamp, before its YES/NO
+   result supplies an online label or paper-account payout. `determined`, disputed,
+   and amended results are observations, not final labels. At close, forecasts move
+   into a persistent per-ticker settlement queue, freeing the next forecast slot.
+   Polling checks at most three due tickers per cycle. Unavailable results retry
+   after 30 seconds; after one hour they are marked delayed and retry every five
+   minutes. Official forecasts are never discarded because of elapsed time.
 6. Legacy pending entries retain their Coinbase proxy labels. New unbound forecasts
    are research-only and skipped without invented labels. Late forecasts may teach
    the model, but do not count toward entry-time validation.
@@ -69,20 +73,33 @@ window timestamp, whether a previous prediction was just learned, and (when the
 public endpoint is available) the active Kalshi market's `yes_mid` plus the
 model-vs-market probability difference. It also records a one-contract prediction match and a separate demo account.
 
-Learning freshness is tracked separately from prediction accuracy. If a pending
+Learning freshness is tracked separately from prediction accuracy. If a legacy proxy
 window is older than the available candle history, the system marks it as skipped
 rather than inventing an outcome, starts a fresh pending window, and reports
 `RECOVERED / WAITING FOR FRESH RESULT`. The risk gate remains blocked until a
-new outcome is learned.
+new outcome is learned. Exact-ticker settlement polling continues during Coinbase
+outages or feature-history gaps. If an old ticker has left Kalshi's live dataset,
+the collector checks the public historical-market endpoint after a live 404.
 The demo account starts with $100 and uses up to $10 per eligible trade, including
 an **assumed 3¢ per-contract cost allowance** (2¢ fees + 1¢ slippage). This is a
 conservative modeling assumption, not a verified fee schedule. Quantity cannot
 exceed observed executable ask depth. Account entries require actual orderbook
 quotes; missing prices never create synthetic demo-account fills. Settlement uses
-the official result of the recorded ticker. A committed paper entry is frozen;
-later WAIT recommendations do not retroactively erase it. If its settlement remains
-unavailable after one hour, the entry is preserved as unresolved and the account
-blocks new trades pending settlement review; it is not treated as a cancelled fill.
+the finalized result of the recorded ticker. A committed paper entry is frozen;
+later WAIT recommendations do not retroactively erase it. Until it is finalized,
+the account blocks overlapping entries, while new forecasts continue to be recorded.
+Delayed entries remain in the retry queue; they are not treated as cancelled fills.
+Legacy `unresolved_demo_trades` with official tickers automatically reenter polling.
+Exit timestamps identify the end of the target interval; `settled_at` separately
+records when the final result was received locally.
+
+Older provisional scores still in the rolling state are reconciled without a
+second model update or a second account trade. Any previously credited paper payout
+is corrected by its net difference. If a final label differs from one already
+learned by an older version, the state records `revised_learning_labels` and blocks
+new paper entries until a deliberate retrain/reset; arbitrary past online updates
+cannot safely be undone. Reconciliation does not recover missing/pruned historical
+state or silently rebuild the live model.
 
 Historical one-contract prediction-match scoring is separate from this account.
 It includes legacy Coinbase proxy results and may use a synthetic 50¢ price when
@@ -114,8 +131,9 @@ The dashboard shows **TRADE NOW** only for a paper candidate that passes all che
   forecast window, and at least 60 seconds until market close. A start-of-window
   forecast is not reused as an intrawindow recommendation.
 - Existing volatility ≤3%, candle range ≤5%, drawdown, and weak-performance guards.
-- At least **100 distinct, entry-time, officially settled Kalshi forecasts**.
-  Legacy proxy matches and late forecasts do not satisfy this preliminary gate.
+- At least **100 distinct, entry-time, finalized Kalshi forecasts**, each with a
+  valid settlement timestamp. Provisional results, legacy proxy matches and late
+  forecasts do not satisfy this preliminary gate.
   On ≥20 official samples, rolling accuracy must be ≥50% and Brier must beat the
   constant-50% baseline of 0.250. The app reports reliability bins without claiming
   that the probabilities have been calibrated.
@@ -151,12 +169,24 @@ custom state file). The archive uses SQLite WAL and transactional writes, with:
   retain their original timestamps.
 - Immutable original forecasts: probability, features, issue time, contract,
   frozen market snapshot, and model-at-issue snapshot for new records.
-- Exact official settlement observations, including when their label was first
-  received locally. Market close is **not** assumed to be label-availability time.
+- Append-only result-stage observations and first finalized settlements, including
+  first local receipt times. Market close and provisional determination are **not**
+  assumed to be final-label availability times.
 - Decision/check/TypeSafe snapshots and immutable qualifying paper entries.
 - Separately labelled legacy proxy scores, imported official records, and skips.
 
-Duplicates do not overwrite earlier evidence, and pruning/retraining the rolling
+Schema 2 adds `settlement_observations`. The next normal collector write upgrades
+a schema-1 archive additively and preserves its original settlement observations.
+An old provisional `settlements` row may advance to a finalized result only after
+the original observation has been preserved; its label-availability time advances
+to the actual receipt of finalization. First finalized results remain immutable.
+Read-only evaluation never upgrades an archive and excludes provisional schema-1
+results. Existing schema-1 backups remain verifiable with the updated backup tool.
+After an upgrade, rollback code must also support schema 2. Schema-1-only code
+requires restoring a matching pre-upgrade state/archive backup pair; that pair
+does not include records collected after the backup.
+
+Duplicates do not overwrite earlier observations, and pruning/retraining the rolling
 JSON state does not delete the archive. Imported legacy records with missing
 features or quotes stay missing; today's candles/prices are not used to fill them.
 State resets get distinct run IDs. Account audits keep separate $100 runs separate.
@@ -183,7 +213,7 @@ or trade gates; stale/insufficient reports cannot enable trades.
 
 The report separates three questions:
 
-1. **Actual frozen forward predictions:** exact timely official outcomes only,
+1. **Actual frozen forward predictions:** exact timely finalized outcomes only,
    deduplicated by ticker across runs; accuracy with Wilson 95% intervals, Brier,
    log loss, reliability bins, a constant-50% baseline, and a market-midpoint
    baseline only where fresh aligned frozen bid/ask quotes actually exist.
@@ -259,7 +289,7 @@ paper-monitoring runner alive across crashes and user logins:
 - `com.kalshi.btc15m.runner.plist`
 
 The installed services check health every 30 seconds, run a fresh model cycle at
-each 15-minute boundary, learn the exact previous contract settlement, and log
+each 15-minute boundary, learn finalized queued contract settlements, and log
 telemetry. They retry lagging candles/entry evidence during the short entry window,
 and unresolved prior settlements without requiring the browser to be open. They use live Coinbase/Kalshi public data and update the demo account
 only; they never place a real order.

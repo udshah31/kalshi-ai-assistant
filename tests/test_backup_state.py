@@ -56,6 +56,15 @@ class BackupStateTests(unittest.TestCase):
         self.assertFalse(self.archive.exists())
         self.assertFalse(self.backups.exists())
 
+    def test_existing_schema_one_backup_remains_verifiable_without_upgrade(self):
+        with closing(sqlite3.connect(self.archive)) as connection, connection:
+            connection.execute("DROP TABLE settlement_observations")
+            connection.execute("UPDATE archive_metadata SET value='1' WHERE key='schema_version'")
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        backup_state.verify_backup(destination)
+        with closing(sqlite3.connect(destination / self.archive.name)) as connection:
+            self.assertEqual(connection.execute("SELECT value FROM archive_metadata WHERE key='schema_version'").fetchone(), ("1",))
+
     def test_corrupt_archive_leaves_no_published_or_partial_backup(self):
         self.archive.write_bytes(b"not a SQLite database")
         with self.assertRaises((sqlite3.Error, ValueError)):

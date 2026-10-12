@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from btc_predictor import load_state, state_transaction
-from forecast_archive import SCHEMA_VERSION, archive_path
+from forecast_archive import READABLE_SCHEMA_VERSIONS, archive_path
 
 BACKUP_NAME = re.compile(r"btc15m-backup-\d{8}T\d{12}Z-[0-9a-f]{8}")
 
@@ -66,7 +66,7 @@ def verify_backup(directory: str | Path) -> dict:
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
             raise ValueError("Backup archive integrity check failed")
         version = connection.execute("SELECT value FROM archive_metadata WHERE key='schema_version'").fetchone()
-        if version != (str(SCHEMA_VERSION),):
+        if version not in {(str(value),) for value in READABLE_SCHEMA_VERSIONS}:
             raise ValueError("Unsupported backup archive schema")
     return manifest
 

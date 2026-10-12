@@ -16,6 +16,7 @@ from forecast_archive import (
 )
 from live_runner import current_prediction_cycle, initial_prediction_cycle, recommendation_needs_retry, run_validation
 from validation import evaluate_archive, report_summary
+from finalized_fixtures import finalized_history, finalized_snapshot
 
 START = 1800000000
 NOW = START+60
@@ -88,8 +89,7 @@ class ValidationIntegrationTests(unittest.TestCase):
     def test_real_entry_archiving_and_exact_result_have_cost_aware_audit(self):
         model = OnlineLogisticRegression(7)
         state = new_state(model); state["last_learned_bar"] = BAR
-        state["paper_trades"] = [{"market_ticker":f"old-{i}","outcome_source":"kalshi_official",
-                                  "probability_up":.8,"correct":True,"outcome":"UP"} for i in range(100)]
+        state["paper_trades"] = finalized_history(bar=BAR, prefix="old-")
         with patch("btc_predictor.feature_vector", return_value=FEATURES), patch.object(model, "predict_proba", return_value=.8):
             pred = predict_and_queue(model, state, [WindowBar(BAR,100,101,99,100,1)], snapshot(), now=NOW)
         pred = finalize_prediction(pred, state, {"enabled":False,"status":"disabled"}, now=NOW)
@@ -97,7 +97,7 @@ class ValidationIntegrationTests(unittest.TestCase):
         archive_and_guard(self.state_file, state, [], pred, now=NOW)
         pending = state["pending"]
         state["paper_trades"].append({**pending, "outcome":"UP","settled_at":START+910,
-                                      "official_result_snapshot":{"ticker":snapshot()["ticker"],"close_time":START+900,"result":"yes"}})
+                                      "official_result_snapshot":finalized_snapshot(snapshot()["ticker"], START+900)})
         state["pending"] = None
         record_cycle(self.archive, state, now=START+920)
         report = evaluate_archive(self.archive)
@@ -105,8 +105,8 @@ class ValidationIntegrationTests(unittest.TestCase):
         self.assertEqual(account["status"], "recorded_entries_audited", account)
         self.assertEqual(account["settled_count"], 1)
         self.assertAlmostEqual(account["net_realized_pnl"], pending["demo_quantity"]-pending["demo_cost"])
-        self.assertEqual(report["forward"]["scored_count"], 1)
-        self.assertEqual(report["forward"]["status"], "insufficient_data")
+        self.assertEqual(report["forward"]["scored_count"], 101)
+        self.assertEqual(report["forward"]["status"], "descriptive_evaluation")
         self.assertEqual(report["walk_forward"]["fold_count"], 0)
 
     def test_output_summary_matches_full_report_and_stays_compact(self):
