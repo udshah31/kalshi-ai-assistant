@@ -19,7 +19,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+READABLE_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
 ANALYTICS_LIMIT = 25
 ROLLING_WINDOW = 25
 ROLLING_STRIDE = 5
