@@ -66,6 +66,7 @@ class ValidationIntegrationTests(unittest.TestCase):
         self.assertFalse(summary["calibration_applied_live"])
         self.assertNotIn("folds", summary["walk_forward"])
         self.assertNotIn("predictions", summary["forward"])
+        self.assertIn("typesafe_evaluation", summary)
         self.assertEqual(summary_file.resolve(), Path(result["summary_file"]).resolve())
 
     def test_pending_unavailable_or_malformed_summary_never_implies_validation(self):

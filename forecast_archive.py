@@ -48,6 +48,7 @@ MARKET_FIELDS = {
 REVIEW_FIELDS = {
     "enabled", "status", "choice", "confidence", "probabilities", "fingerprint",
     "bar_timestamp", "market_ticker", "reviewed_at", "expires_at", "applies_to_current_evidence",
+    "model",
 }
 MODEL_FIELDS = {"n_features", "learning_rate", "l2", "weights", "bias", "updates"}
 SCHEMA = """
