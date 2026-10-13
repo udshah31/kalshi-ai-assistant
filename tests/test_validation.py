@@ -32,6 +32,12 @@ CREATE TABLE paper_entries (
  entered_at REAL, side TEXT, quantity INTEGER, entry_price REAL, cost REAL,
  cost_allowance REAL, market_snapshot_json TEXT, checks_json TEXT, review_json TEXT
 );
+CREATE TABLE decisions (
+ decision_id TEXT PRIMARY KEY, state_id TEXT, forecast_id TEXT REFERENCES forecasts(forecast_id),
+ bar_timestamp INTEGER, decided_at REAL, market_ticker TEXT, action TEXT,
+ probability_up REAL, market_snapshot_json TEXT, checks_json TEXT, blockers_json TEXT,
+ review_json TEXT, cost_allowance REAL, quantity INTEGER, cost REAL
+);
 CREATE TABLE candles (
  product_id TEXT, timestamp INTEGER, open REAL, high REAL, low REAL,
  close REAL, volume REAL, observed_at REAL
@@ -118,6 +124,31 @@ class ValidationTests(unittest.TestCase):
         entry.update(changes or {})
         self.insert("paper_entries", entry)
         return entry
+
+    def add_decision(self, index, *, action="TRADE", review=None, changes=None):
+        if not self._forecast_exists(index):
+            self.add_forecast(index)
+        bar = 180000 + index * 900
+        values = {
+            "decision_id": f"d{index}-{self._decision_count()}", "state_id": "state-A",
+            "forecast_id": f"f{index}", "bar_timestamp": bar, "decided_at": bar + 931,
+            "market_ticker": f"BTC-{index}", "action": action,
+            "probability_up": .75, "market_snapshot_json": json.dumps(market(index)),
+            "checks_json": json.dumps({"typesafe": action == "TRADE"}),
+            "blockers_json": json.dumps([]), "review_json": json.dumps(review) if review is not None else None,
+            "cost_allowance": .03, "quantity": 10, "cost": 5.5,
+        }
+        values.update(changes or {})
+        self.insert("decisions", values)
+        return values
+
+    def _forecast_exists(self, index):
+        with closing(sqlite3.connect(self.archive)) as db:
+            return db.execute("SELECT 1 FROM forecasts WHERE forecast_id = ?", (f"f{index}",)).fetchone() is not None
+
+    def _decision_count(self):
+        with closing(sqlite3.connect(self.archive)) as db:
+            return db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
 
     def evaluate(self, **kwargs):
         report = validation.evaluate_archive(self.archive, **kwargs)
@@ -257,6 +288,56 @@ class ValidationTests(unittest.TestCase):
         report = self.evaluate()
         self.assertEqual(report["forward"]["scored_count"], 0)
         self.assertEqual(report["forward"]["unscored_count"], 1)
+
+    def test_typesafe_evaluation_groups_reviews_against_official_outcomes(self):
+        self.add_forecast(0, label=1)
+        self.add_forecast(1, label=0)
+        self.add_decision(0, review={"enabled": True, "status": "ok", "choice": "approve_trade", "confidence": .9}, action="TRADE")
+        self.add_decision(1, review={"enabled": True, "status": "ok", "choice": "review", "confidence": .44}, action="WAIT")
+
+        evaluation = self.evaluate()["typesafe_evaluation"]
+
+        self.assertEqual(evaluation["status"], "descriptive_evaluation")
+        self.assertEqual(evaluation["event_telemetry"]["decision_count"], 2)
+        self.assertEqual(evaluation["event_telemetry"]["status_counts"], {"ok": 2})
+        self.assertEqual(evaluation["groups"]["approved_and_final_trade"]["scored_count"], 1)
+        self.assertEqual(evaluation["groups"]["approved_and_final_trade"]["underlying_candidate_metrics"]["accuracy"], 1.0)
+        self.assertEqual(evaluation["groups"]["valid_nonapproval"]["scored_count"], 1)
+        self.assertEqual(evaluation["groups"]["valid_nonapproval"]["underlying_candidate_metrics"]["accuracy"], 1.0)
+
+    def test_typesafe_evaluation_deduplicates_and_rejects_mismatched_reviews(self):
+        self.add_forecast(0)
+        self.add_decision(0, review={"enabled": True, "status": "ok", "choice": "approve_trade", "confidence": .9}, action="TRADE")
+        self.add_decision(0, review={"enabled": True, "status": "ok", "choice": "approve_trade", "confidence": .9}, action="TRADE")
+        self.add_decision(0, review={"enabled": True, "status": "ok", "choice": "approve_trade", "confidence": .9,
+                                    "market_ticker": "wrong"}, action="TRADE",
+                           changes={"decision_id": "d0-mismatch"})
+        self.add_decision(9, review={"enabled": True, "status": "error"}, action="WAIT",
+                           changes={"forecast_id": "missing-f9"})
+
+        evaluation = self.evaluate()["typesafe_evaluation"]
+
+        self.assertEqual(evaluation["event_telemetry"]["decision_count"], 4)
+        self.assertEqual(evaluation["event_telemetry"]["identity_mismatch_count"], 1)
+        self.assertEqual(evaluation["event_telemetry"]["unlinked_decision_count"], 1)
+        self.assertEqual(evaluation["unique_forecast_telemetry"]["reviewed_forecast_count"], 1)
+        self.assertEqual(evaluation["unique_forecast_telemetry"]["duplicate_decision_count"], 1)
+        self.assertEqual(evaluation["groups"]["approved_and_final_trade"]["forecast_count"], 1)
+
+    def test_typesafe_evaluation_never_scores_nonfinalized_outcomes(self):
+        self.add_forecast(0)
+        with closing(sqlite3.connect(self.archive)) as db, db:
+            snapshot = finalized_snapshot("BTC-0", market(0)["close_time"], "yes")
+            snapshot["status"] = "determined"
+            db.execute("UPDATE settlements SET snapshot_json = ? WHERE forecast_id = ?", (json.dumps(snapshot), "f0"))
+        self.add_decision(0, review={"enabled": True, "status": "ok", "choice": "approve_trade", "confidence": .9}, action="TRADE")
+
+        evaluation = self.evaluate()["typesafe_evaluation"]
+
+        group = evaluation["groups"]["approved_and_final_trade"]
+        self.assertEqual(group["forecast_count"], 1)
+        self.assertEqual(group["scored_count"], 0)
+        self.assertIsNone(group["underlying_candidate_metrics"]["accuracy"])
 
     def test_midpoint_baseline_requires_real_fresh_aligned_quotes(self):
         self.add_forecast(0)

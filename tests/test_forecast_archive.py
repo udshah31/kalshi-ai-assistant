@@ -139,11 +139,12 @@ class ForecastArchiveTests(unittest.TestCase):
     def test_public_snapshots_do_not_store_secret_fields(self):
         secret = "unit-test-secret-not-a-real-key"
         self.state["pending"]["market_snapshot"]["api_key"] = secret
-        self.state["pending"]["typesafe_review"] = {"enabled": True, "status": "ok", "api_key": secret}
+        self.state["pending"]["typesafe_review"] = {"enabled": True, "status": "ok", "model": "jev-1.13.0", "api_key": secret}
         prediction = {"bar_timestamp": BAR, "kalshi": self.state["pending"]["market_snapshot"], "trade_signal": "WAIT",
-                      "typesafe_review": {"status": "error", "reason": secret, "Authorization": secret}}
+                      "typesafe_review": {"status": "error", "model": "jev-1.13.0", "reason": secret, "Authorization": secret}}
         record_cycle(self.path, self.state, prediction=prediction, now=NOW)
         self.assertNotIn(secret, json.dumps(self.rows("forecasts")+self.rows("decisions")))
+        self.assertEqual(json.loads(self.rows("decisions")[0]["review_json"])["model"], "jev-1.13.0")
 
     def test_committed_paper_entry_is_immutable_and_distinct_from_matches(self):
         record = self.state["pending"]

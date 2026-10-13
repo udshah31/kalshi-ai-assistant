@@ -54,10 +54,18 @@ _COLUMNS = {
         "forecast_id", "entered_at", "side", "quantity", "entry_price", "cost",
         "cost_allowance", "market_snapshot_json", "checks_json", "review_json",
     ),
+    "decisions": (
+        "decision_id", "state_id", "forecast_id", "bar_timestamp", "decided_at",
+        "market_ticker", "action", "probability_up", "market_snapshot_json",
+        "checks_json", "blockers_json", "review_json", "cost_allowance", "quantity", "cost",
+    ),
     "bars": (
         "product_id", "timestamp", "open", "high", "low", "close", "volume", "observed_at",
     ),
 }
+
+TYPESAFE_STATUSES = frozenset({"ok", "error", "unavailable", "skipped", "disabled"})
+TYPESAFE_CHOICES = frozenset({"approve_trade", "wait", "data_issue", "review"})
 
 
 def _number(value: Any) -> float | None:
@@ -485,6 +493,191 @@ def _metrics(probabilities: Sequence[float], labels: Sequence[int]) -> dict[str,
     }
 
 
+def _typesafe_review_details(row: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
+    """Parse only whitelisted review evidence; never expose raw review payloads."""
+    raw = row.get("review_json")
+    if raw is None:
+        return None, "missing", "missing"
+    review = _json(raw, dict)
+    if review is None:
+        return None, "malformed", "malformed"
+    raw_status = review.get("status")
+    status = raw_status if isinstance(raw_status, str) and raw_status else "unknown"
+    raw_choice = review.get("choice")
+    choice = raw_choice if isinstance(raw_choice, str) and raw_choice else "missing"
+    return review, status, choice
+
+
+def _typesafe_identity_errors(
+    decision: dict[str, Any], forecast: dict[str, Any], review: dict[str, Any] | None,
+) -> list[str]:
+    """Require optional decision/review identity evidence to agree with the frozen forecast."""
+    errors: list[str] = []
+    decision_ticker = decision.get("market_ticker")
+    if decision_ticker is not None and decision_ticker != forecast["market_ticker"]:
+        errors.append("decision_ticker_mismatch")
+    decision_bar = decision.get("bar_timestamp")
+    if decision_bar is not None:
+        parsed_bar = _number(decision_bar)
+        if parsed_bar is None or parsed_bar != forecast["bar_timestamp"]:
+            errors.append("decision_bar_timestamp_mismatch")
+    if review is not None:
+        review_ticker = review.get("market_ticker")
+        if review_ticker is not None and review_ticker != forecast["market_ticker"]:
+            errors.append("review_ticker_mismatch")
+        review_bar = review.get("bar_timestamp")
+        if review_bar is not None:
+            parsed_bar = _number(review_bar)
+            if parsed_bar is None or parsed_bar != forecast["bar_timestamp"]:
+                errors.append("review_bar_timestamp_mismatch")
+    return errors
+
+
+def _typesafe_group_metrics(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Measure outcomes of underlying candidates, never TypeSafe as a label."""
+    scored = [record for record in records if record.get("settlement") is not None]
+    probabilities = [record["probability_up"] for record in scored]
+    labels = [record["settlement"]["label"] for record in scored]
+    metrics = _metrics(probabilities, labels)
+    return {
+        "forecast_count": len(records),
+        "scored_count": len(scored),
+        "unscored_count": len(records) - len(scored),
+        "underlying_candidate_metrics": {
+            "accuracy": metrics["accuracy"],
+            "brier_score": metrics["brier_score"],
+            "log_loss": metrics["log_loss"],
+            "mean_probability_up": sum(probabilities) / len(probabilities) if probabilities else None,
+            "observed_up_rate": sum(labels) / len(labels) if labels else None,
+        },
+    }
+
+
+def _typesafe_evaluation(
+    rows: dict[str, list[dict[str, Any]]], canonical_records: Sequence[dict[str, Any]],
+    valid_forecasts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Descriptively evaluate TypeSafe review groups against finalized official outcomes.
+
+    This intentionally does not call TypeSafe, alter state, or treat a review as a
+    training label. The only label used below is the strict finalized Kalshi result
+    already attached to each canonical forecast.
+    """
+    decisions = rows.get("decisions", [])
+    canonical_ids = {record["forecast_id"] for record in canonical_records}
+    status_counts: Counter[str] = Counter()
+    choice_counts: Counter[str] = Counter()
+    events: list[dict[str, Any]] = []
+    linked_valid = 0
+    linked_canonical = 0
+    unlinked = 0
+    duplicate_forecast_decisions = 0
+    identity_mismatches = 0
+    malformed_reviews = 0
+
+    for decision in decisions:
+        review, status, choice = _typesafe_review_details(decision)
+        status_counts[status] += 1
+        choice_counts[choice] += 1
+        if status == "malformed":
+            malformed_reviews += 1
+        forecast_id = decision.get("forecast_id")
+        forecast = valid_forecasts.get(forecast_id) if isinstance(forecast_id, str) else None
+        event = {
+            "decision_id": decision.get("decision_id"),
+            "forecast_id": forecast_id,
+            "review": review,
+            "status": status,
+            "choice": choice,
+            "action": decision.get("action"),
+            "decided_at": timestamp_seconds(decision.get("decided_at")),
+            "link_status": "unlinked",
+            "identity_errors": [],
+        }
+        if forecast is None:
+            unlinked += 1
+        else:
+            linked_valid += 1
+            if forecast_id not in canonical_ids:
+                duplicate_forecast_decisions += 1
+                event["link_status"] = "duplicate_forecast"
+            else:
+                errors = _typesafe_identity_errors(decision, forecast, review)
+                event["identity_errors"] = errors
+                if errors:
+                    identity_mismatches += 1
+                else:
+                    linked_canonical += 1
+                    event["link_status"] = "linked_canonical"
+        events.append(event)
+
+    by_forecast: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        if event["link_status"] == "linked_canonical":
+            by_forecast.setdefault(event["forecast_id"], []).append(event)
+
+    selected: dict[str, dict[str, Any]] = {}
+    for forecast_id, candidates in by_forecast.items():
+        # Prefer a parseable review, then the earliest immutable decision.
+        candidates.sort(key=lambda event: (
+            0 if event["review"] is not None and event["status"] in TYPESAFE_STATUSES else 1,
+            event["decided_at"] if event["decided_at"] is not None else float("inf"),
+            str(event["decision_id"]),
+        ))
+        selected[forecast_id] = candidates[0]
+
+    group_names = (
+        "approved_and_final_trade", "approved_but_final_wait", "valid_nonapproval",
+        "review_error_or_unavailable", "not_reviewed", "invalid_or_missing_review",
+    )
+    groups: dict[str, list[dict[str, Any]]] = {name: [] for name in group_names}
+    for forecast_id, event in selected.items():
+        status, choice = event["status"], event["choice"]
+        if status == "ok" and choice == "approve_trade":
+            group = "approved_and_final_trade" if event["action"] == "TRADE" else "approved_but_final_wait"
+        elif status == "ok" and choice in TYPESAFE_CHOICES - {"approve_trade"}:
+            group = "valid_nonapproval"
+        elif status in {"error", "unavailable"}:
+            group = "review_error_or_unavailable"
+        elif status in {"skipped", "disabled"}:
+            group = "not_reviewed"
+        else:
+            group = "invalid_or_missing_review"
+        groups[group].append({**valid_forecasts[forecast_id], "decision": event})
+
+    scored_count = sum(
+        len([record for record in records if record.get("settlement") is not None])
+        for records in groups.values()
+    )
+    return {
+        "status": "descriptive_evaluation" if scored_count else "insufficient_data",
+        "event_telemetry": {
+            "decision_count": len(decisions),
+            "linked_valid_forecast_count": linked_valid,
+            "linked_canonical_forecast_count": linked_canonical,
+            "unlinked_decision_count": unlinked,
+            "duplicate_forecast_decision_count": duplicate_forecast_decisions,
+            "identity_mismatch_count": identity_mismatches,
+            "malformed_review_count": malformed_reviews,
+            "status_counts": dict(sorted(status_counts.items())),
+            "choice_counts": dict(sorted(choice_counts.items())),
+        },
+        "unique_forecast_telemetry": {
+            "canonical_forecast_count": len(canonical_records),
+            "reviewed_forecast_count": len(selected),
+            "missing_decision_count": len(canonical_records) - len(selected),
+            "duplicate_decision_count": sum(max(0, len(events_for_forecast) - 1)
+                                             for events_for_forecast in by_forecast.values()),
+        },
+        "groups": {name: _typesafe_group_metrics(records) for name, records in groups.items()},
+        "interpretation": (
+            "TypeSafe choices and confidence are descriptive action-review telemetry. "
+            "Only finalized official Kalshi results label the underlying candidate; "
+            "these metrics do not train the model or change live gates."
+        ),
+    }
+
+
 def _collection_quality(rows: dict[str, list[dict[str, Any]]], records: list[dict[str, Any]],
                         excluded: Counter[str], missing: Counter[str]) -> dict[str, Any]:
     """Describe collection quality; these metrics never authorize a trade."""
@@ -901,6 +1094,7 @@ def evaluate_archive(path: str | Path, train_size: int = 100, calibration_size: 
         absent.append("no eligible archived feature vectors for retraining")
     forward = _forward(records)
     walk_forward = _walk_forward(records, train_size, calibration_size, test_size, epochs)
+    typesafe = _typesafe_evaluation(rows, records, all_forecasts)
     if forward["status"] == "insufficient_data":
         absent.append(f"forward official scored samples: {forward['scored_count']}/{MIN_LIVE_SAMPLES}; more prospective evidence needed")
     if walk_forward["status"] == "insufficient_data":
@@ -920,6 +1114,7 @@ def evaluate_archive(path: str | Path, train_size: int = 100, calibration_size: 
         },
         "forward": forward, "walk_forward": walk_forward,
         "paper_account": _paper_account(rows["paper_entries"], all_forecasts, settlement_map),
+        "typesafe_evaluation": typesafe,
         "limitations": [
             "Offline report only: no live probabilities, model files, approvals, or trade gates are changed.",
             "Only exact archived finalized Kalshi results with a valid settlement timestamp are scored; provisional, proxy and candle-derived labels are excluded.",
@@ -928,6 +1123,7 @@ def evaluate_archive(path: str | Path, train_size: int = 100, calibration_size: 
             "Platt calibration is EXPERIMENTAL, fit on held-out past records, frozen for each test block, and never applied live.",
             "Wilson intervals and reliability bins are descriptive; overlapping market conditions, selection effects, and small samples limit statistical conclusions.",
             "Fresh-model forecast metrics are not the actual forward paper strategy and cannot inherit TypeSafe approvals or demonstrate trading profitability.",
+            "TypeSafe groups are descriptive telemetry only; finalized official Kalshi outcomes are the only labels and TypeSafe data is not used for training or live gates.",
             "Paper accounting uses recorded fill/cost assumptions only, starts realized equity at $100, and cannot verify real executions or actual exchange fees.",
             "No historical prices, simulated trades, optimized thresholds, annualized returns, or Sharpe ratios are fabricated.",
         ],
@@ -941,7 +1137,8 @@ def report_summary(report: dict[str, Any]) -> dict[str, Any]:
                "limitations": report["limitations"]}
     for section, omitted in (("data_quality", {"rejected_forecasts"}), ("forward", {"predictions"}),
                              ("walk_forward", {"folds"}),
-                             ("paper_account", {"resolved_equity_curve", "settled_entries", "unresolved_entries", "invalid_entries", "runs"})):
+                             ("paper_account", {"resolved_equity_curve", "settled_entries", "unresolved_entries", "invalid_entries", "runs"}),
+                             ("typesafe_evaluation", set())):
         summary[section] = {key: value for key, value in report[section].items() if key not in omitted}
     return summary
 
