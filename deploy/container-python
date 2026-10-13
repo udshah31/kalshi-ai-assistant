@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Run one Kalshi Python command in the pinned production container.
+set -Eeuo pipefail
+
+job=${1:?usage: container-python JOB COMMAND [ARGS...]}
+shift
+case "$job" in
+    backup|comparison|dashboard|inspect|runner) ;;
+    *) printf 'container-python: unsupported job: %s\n' "$job" >&2; exit 2 ;;
+esac
+
+CONFIG=/etc/kalshi/container-runtime.env
+[[ -r "$CONFIG" ]] || { printf 'container-python: missing %s\n' "$CONFIG" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG"
+[[ "${KALSHI_IMAGE:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf 'container-python: KALSHI_IMAGE must be a digest\n' >&2
+    exit 1
+}
+
+uid=$(id -u kalshi)
+gid=$(id -g kalshi)
+exec /usr/bin/docker run --rm --init --name "kalshi-$job" \
+    --network host \
+    --user "$uid:$gid" \
+    --read-only --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --pull never \
+    --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONUNBUFFERED=1 \
+    --env-file /etc/kalshi/kalshi.env \
+    --mount type=bind,source=/opt/kalshi,target=/opt/kalshi,readonly \
+    --mount type=bind,source=/var/lib/kalshi,target=/var/lib/kalshi \
+    "$KALSHI_IMAGE" python3 -u "$@"

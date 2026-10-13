@@ -1,0 +1,15 @@
+[Unit]
+Description=Kalshi verified backup (pinned Python container)
+Requires=docker.service
+After=docker.service
+ConditionPathExists=/var/lib/kalshi/btc_15m_state.json
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kalshi
+ExecStart=/opt/kalshi/deploy/container-python backup /opt/kalshi/backup_state.py create --state-file /var/lib/kalshi/btc_15m_state.json --backup-dir /var/lib/kalshi/backups --keep 7
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

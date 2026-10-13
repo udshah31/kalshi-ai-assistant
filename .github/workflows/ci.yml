@@ -65,7 +65,10 @@ jobs:
               "backup_state.py",
               "deploy/install.sh",
               "deploy/oracle-deploy.sh",
+              "deploy/oracle-container-deploy.sh",
               "deploy/oracle-rollback.sh",
+              "deploy/container-python",
+              "deploy/container-systemd/kalshi-runner.service",
           }
           missing = sorted(required - set(names))
           if missing:

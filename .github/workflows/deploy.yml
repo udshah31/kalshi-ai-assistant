@@ -125,9 +125,9 @@ jobs:
           test -n "$ORACLE_USER"
 
           local_bundle="$RUNNER_TEMP/kalshi-ubuntu.tgz"
-          local_helper="$RUNNER_TEMP/oracle-deploy.sh"
+          local_helper="$RUNNER_TEMP/oracle-container-deploy.sh"
           cp dist/kalshi-ubuntu.tgz "$local_bundle"
-          tar -xOf "$local_bundle" deploy/oracle-deploy.sh > "$local_helper"
+          tar -xOf "$local_bundle" deploy/oracle-container-deploy.sh > "$local_helper"
           chmod 700 "$local_helper"
 
           ssh_options=(

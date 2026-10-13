@@ -316,12 +316,13 @@ python3 live_runner.py --hours 3
 
 ## Oracle Cloud Ubuntu deployment
 
-The Linux deployment is in [`deploy/README.md`](deploy/README.md). It includes
-systemd services for the existing runner/dashboard, a staging installer, and a
-daily verified backup timer. The dashboard is accessed through an SSH tunnel.
-The scripts are provider-neutral and can run on an Ubuntu 24.04 VM in Oracle
-Cloud. Create the VM, then migrate the existing state and archive so the forward
-evidence and account run continue together.
+The Linux deployment is in [`deploy/README.md`](deploy/README.md). The current
+Oracle host is Ubuntu 20.04 ARM64, so the Kalshi runner/dashboard use a pinned
+Python 3.12 Docker image under systemd while the existing `trading-*` Docker
+stack remains independent. The dashboard is accessed through an SSH tunnel.
+Create the VM or use the documented container prerequisites, then migrate the
+existing state and archive so the forward evidence and account run continue
+together.
 
 Build a code-only upload with `bash deploy/package.sh`; it produces
 `dist/kalshi-ubuntu.tgz`. The live model/archive are transferred separately using
@@ -345,8 +346,9 @@ the deployment guide includes an SSH export command.
 GitHub Actions runs the test suite, Python compilation checks, shell syntax checks,
 and code-bundle inspection on every push and pull request. Production delivery is
 manual and approval-gated through the `production` GitHub Environment. The deploy
-workflow updates code and systemd units on the Oracle VM, creates a verified remote
-evidence backup first, restarts the services, and checks `/health`; it does not
+workflow updates the bind-mounted code and container systemd units on the Oracle
+VM, creates a verified remote evidence backup first, restarts the services, and
+checks `/health`; it does not
 overwrite or migrate the live state/archive. See
 [`deploy/README.md`](deploy/README.md#6-github-actions-cicd).
 
