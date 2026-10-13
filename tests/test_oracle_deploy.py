@@ -71,6 +71,10 @@ class OracleDeployScriptTests(unittest.TestCase):
             self.assertIn("/opt/kalshi/deploy/container-python", unit)
             self.assertNotIn("/usr/bin/python3", unit)
 
+    def test_container_deploy_opens_staged_code_for_the_service_uid(self):
+        script = (ROOT / "deploy/oracle-container-deploy.sh").read_text(encoding="utf-8")
+        self.assertIn('chmod 0755 "$STAGE"', script)
+
 
 class OracleDeployTransactionTests(unittest.TestCase):
     UNITS = (

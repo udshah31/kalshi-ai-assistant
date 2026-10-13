@@ -176,6 +176,7 @@ exec 9>"$LOCK_FILE"
 flock -n 9 || fail "another deployment is already running"
 mkdir -p "$ROLLBACK_DIR" "$ROLLBACK_UNITS"
 tar -xzf "$BUNDLE" -C "$STAGE"
+chmod 0755 "$STAGE"
 container_python "$STAGE" /opt/kalshi/backup_state.py create \
     --state-file /var/lib/kalshi/btc_15m_state.json --backup-dir /var/lib/kalshi/backups --keep 7
 SNAPSHOT=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'btc15m-backup-*' -print | sort | tail -n 1)
