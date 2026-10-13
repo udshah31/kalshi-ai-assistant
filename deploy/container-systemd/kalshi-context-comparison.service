@@ -1,0 +1,16 @@
+[Unit]
+Description=Kalshi context comparison (pinned Python container)
+Requires=docker.service
+After=docker.service
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kalshi
+ExecStart=/opt/kalshi/deploy/container-python comparison /opt/kalshi/validation.py compare-context --archive-file /var/lib/kalshi/btc_15m_state_archive.sqlite3 --output-json /var/lib/kalshi/btc_15m_context_comparison.json --train-size 100 --test-size 25 --epochs 5
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=null
+StandardError=journal

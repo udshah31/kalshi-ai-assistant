@@ -1,10 +1,17 @@
 # Oracle Cloud: Ubuntu deployment
 
-Run the same paper collector/dashboard on one Ubuntu VM. The scripts are
-provider-neutral; this guide uses Oracle Cloud as the example provider. Code is
-installed in `/opt/kalshi`; existing state, archive, telemetry, and backups live
-in `/var/lib/kalshi`. Services use a dedicated `kalshi` user and start on reboot.
-The dashboard listens on `127.0.0.1:8765` and is reached through SSH.
+Run the same paper collector/dashboard on one Ubuntu VM. The current Oracle host
+is **Ubuntu 20.04 ARM64 with Docker** and a separate `trading-*` Compose stack.
+Kalshi uses a pinned Python 3.12 ARM64 container managed by systemd; it does not
+use the host Python 3.8. Code is installed in `/opt/kalshi`; existing state,
+archive, telemetry, and backups live in `/var/lib/kalshi`. Services use a
+dedicated `kalshi` user and start on reboot. The dashboard listens on
+`127.0.0.1:8765` and is reached through SSH.
+
+The four Kalshi services remain separate from the existing `trading-*` containers.
+Do not run the native-Python `oracle-deploy.sh` or `install.sh` on this host;
+GitHub Actions uses `oracle-container-deploy.sh`, which binds the released
+`/opt/kalshi` code into the preinstalled digest-pinned image.
 
 ## 1. Create the VM in Oracle Cloud
 
@@ -39,7 +46,7 @@ scp -i "$SSH_KEY" dist/kalshi-ubuntu.tgz "$VM_USER@$VM_IP:kalshi-ubuntu.tgz"
 ssh -i "$SSH_KEY" "$VM_USER@$VM_IP"
 ```
 
-On the Ubuntu VM:
+On a new native-Python Ubuntu VM, the legacy staging installer can be used:
 
 ```bash
 sudo apt-get update
@@ -58,6 +65,13 @@ The application runtime is dependency-free: Python's standard library and inline
 browser JavaScript/SVG. Optional Node.js on `PATH` enables the executable dashboard
 renderer/polling tests in the Python suite above; without Node, that test is
 explicitly skipped. Serving the dashboard requires neither Node nor npm packages.
+
+For the existing Oracle VM, Docker, the verified ARM64 image digest in
+`/etc/kalshi/container-runtime.env`, `/etc/kalshi/kalshi.env`, and the `kalshi`
+service account are prerequisites. The container launcher uses host networking,
+bind-mounts `/opt/kalshi` read-only and `/var/lib/kalshi` read/write, and runs the
+application as the `kalshi` UID/GID. The application environment file is never
+included in a code bundle.
 
 ## 3. Cut over with a consistent evidence snapshot
 
@@ -366,14 +380,16 @@ ORACLE_KNOWN_HOSTS       # reviewed ssh-keyscan output
 ```
 
 To prepare `ORACLE_KNOWN_HOSTS`, verify the VM fingerprint through the Oracle
-console or an independent channel, then save the reviewed host-key line:
+console or an independent channel, then save the reviewed host-key lines. Do not
+blindly trust a newly scanned key; compare it with the verified entry first:
 
 ```bash
 ssh-keyscan -H "$VM_IP"
 ```
 
-Store the output as the `ORACLE_KNOWN_HOSTS` secret. The workflow uses strict
-host-key checking and never falls back to `StrictHostKeyChecking=no`.
+Store only the matching verified lines as the `ORACLE_KNOWN_HOSTS` secret. The
+workflow uses strict host-key checking and never falls back to
+`StrictHostKeyChecking=no`.
 
 ### Release code
 
@@ -381,10 +397,10 @@ From the repository's **Actions → Deploy → Run workflow** page, choose the b
 tag, or commit to deploy. GitHub runs the tests and builds the code-only bundle,
 then pauses for approval in the `production` environment. After approval, it:
 
-1. Uploads only the code bundle and deployment helper.
+1. Uploads only the code bundle and container deployment helper.
 2. Stops the Oracle application and scheduled units.
 3. Creates and verifies a lock-consistent remote evidence snapshot.
-4. Installs the new code and systemd units while preserving a rollback tree.
+4. Installs the new bind-mounted code and container systemd units while preserving a rollback tree.
 5. Restarts the services and checks `/health`.
 6. Restores the previous code automatically if service startup or health checks
    fail.
@@ -392,6 +408,13 @@ then pauses for approval in the `production` environment. After approval, it:
 Routine releases do not copy local state or SQLite files to the VM. Initial
 migration and an intentional move of collection between machines still use the
 consistent snapshot procedure in section 3 and must leave only one active runner.
+
+The container deploy helper validates the immutable runtime image before stopping
+services, creates and verifies a backup through that image, compiles staged code
+in the same runtime, and restores the previous code/unit set if startup or
+`/health` verification fails. Future releases must preserve the host-specific
+image and `container-runtime.env`; do not replace it with a mutable tag or
+install a second native Python runtime over the Ubuntu host.
 
 Historical analytics can be rolled out to an existing Oracle installation through
 this same **code-only** workflow using `bash deploy/package.sh`; it needs no state

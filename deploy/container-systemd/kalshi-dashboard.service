@@ -1,0 +1,22 @@
+[Unit]
+Description=Kalshi dashboard (pinned Python container)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/kalshi/btc_15m_state.json
+ConditionPathExists=/var/lib/kalshi/btc_15m_state_archive.sqlite3
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kalshi
+ExecStart=/opt/kalshi/deploy/container-python dashboard /opt/kalshi/dashboard.py --host 127.0.0.1 --port 8765 --lookback-minutes 1440 --state-file /var/lib/kalshi/btc_15m_state.json
+ExecStop=/usr/bin/docker stop --time 130 kalshi-dashboard
+Restart=always
+RestartSec=5
+TimeoutStopSec=150
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

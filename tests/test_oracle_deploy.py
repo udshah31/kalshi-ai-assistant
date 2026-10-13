@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "deploy" / "oracle-deploy.sh"
+CONTAINER_SCRIPT = ROOT / "deploy" / "oracle-container-deploy.sh"
 ROLLBACK_SCRIPT = ROOT / "deploy" / "oracle-rollback.sh"
 
 
@@ -43,6 +44,32 @@ class OracleDeployScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Usage:", result.stdout)
         self.assertIn("deploy-rollbacks", result.stdout)
+
+    def test_container_deploy_help_is_available(self):
+        result = subprocess.run(
+            ["bash", str(CONTAINER_SCRIPT), "--help"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pinned Python container", result.stdout)
+
+    def test_container_runtime_contract_is_digest_pinned_and_state_separated(self):
+        launcher = (ROOT / "deploy/container-python").read_text(encoding="utf-8")
+        self.assertIn("--network host", launcher)
+        self.assertIn("--pull never", launcher)
+        self.assertIn("source=/opt/kalshi,target=/opt/kalshi,readonly", launcher)
+        self.assertIn("source=/var/lib/kalshi,target=/var/lib/kalshi", launcher)
+        self.assertIn("KALSHI_IMAGE:-", launcher)
+        for name in (
+            "kalshi-dashboard.service", "kalshi-runner.service",
+            "kalshi-backup.service", "kalshi-context-comparison.service",
+        ):
+            unit = (ROOT / "deploy/container-systemd" / name).read_text(encoding="utf-8")
+            self.assertIn("/opt/kalshi/deploy/container-python", unit)
+            self.assertNotIn("/usr/bin/python3", unit)
 
 
 class OracleDeployTransactionTests(unittest.TestCase):
