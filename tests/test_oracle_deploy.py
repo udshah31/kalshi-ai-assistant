@@ -83,7 +83,8 @@ class OracleDeployScriptTests(unittest.TestCase):
         self.assertIn("ExecStop=/usr/bin/docker stop --time 30 kalshi-late", unit)
         self.assertNotIn("kalshi-runner.service", unit)
         self.assertNotIn("kalshi-dashboard.service", unit)
-        self.assertIn("late)", (ROOT / "deploy/container-python").read_text(encoding="utf-8").replace("|", ")\n"))
+        self.assertRegex((ROOT / "deploy/container-python").read_text(encoding="utf-8"),
+                         r"case \"\$job\" in\s+backup\|comparison\|dashboard\|inspect\|late\|runner\)")
         script = CONTAINER_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service kalshi-late-window.service)", script)
         self.assertIn("late_window.py", script)
@@ -103,6 +104,23 @@ class OracleDeployScriptTests(unittest.TestCase):
         self.assertIn('rm -f -- "$SYSTEMD_ROOT/$unit"', script)
         self.assertIn("installed_units", script.split("stop_all() {")[1].split("}")[0])
         self.assertIn("installed_units", script.split("start_all() {")[1].split("}")[0])
+
+    def test_late_window_start_is_gated_on_enable_in_deploy_and_manual_rollback(self):
+        rollback = ROLLBACK_SCRIPT.parent / "oracle-rollback.sh"
+        for path in (CONTAINER_SCRIPT, rollback):
+            script = path.read_text(encoding="utf-8")
+            start = script.split("start_all() {")[1].split("\n}\n")[0]
+            self.assertRegex(start, r"kalshi-late-window\.service.*is-enabled --quiet")
+            self.assertRegex(script, r"NEW_UNITS=\(kalshi-late-window\.service\)")
+            self.assertRegex(script.split("stop_all() {")[1].split("\n}\n")[0], r"installed_units")
+
+    def test_manual_rollback_disables_and_removes_unit_missing_from_target(self):
+        script = (ROOT / "deploy/oracle-rollback.sh").read_text(encoding="utf-8")
+        self.assertRegex(script, r"APP_SERVICES=\([^)]*kalshi-late-window\.service")
+        restore = script.split("restore_units() {")[1].split("\n}\n")[0]
+        self.assertRegex(restore, r"systemctl disable --now \"\$unit\"")
+        self.assertRegex(restore, r"rm -f -- \"\$SYSTEMD_ROOT/\$unit\"")
+        self.assertRegex(script, r"NEW_UNITS\[\*\]")
 
 
 class OracleDeployTransactionTests(unittest.TestCase):

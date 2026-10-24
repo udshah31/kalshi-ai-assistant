@@ -244,18 +244,19 @@ migrate the latest evidence, then re-enable the VM writer services with
 see the README's "Late-window collection") into
 `/var/lib/kalshi/btc_15m_state_late_window.sqlite3`. It is independent of the runner
 and dashboard and is not part of the `/health` check. The first release that
-includes it installs the unit; start it once:
+includes it installs the unit but does not start it; enabling it starts the
+pre-registered collection period, so run this once to begin collection:
 
 ```bash
 sudo systemctl enable --now kalshi-late-window.service
 sudo systemctl status kalshi-late-window.service --no-pager
 sudo journalctl -u kalshi-late-window.service -n 30 --no-pager
-sudo systemctl disable --now kalshi-late-window.service   # stop
+sudo systemctl disable --now kalshi-late-window.service   # stop; later deploys will not restart it
 ```
 
 Stopping lets the current window finish and be written first. Backups and the
-export below include the store once it exists. A failed release removes the unit
-again if the previous release did not have it.
+export below include the store once it exists. A failed release, or a manual
+rollback to a release without it, stops and removes the unit again.
 
 Inspect recent service logs or restart after a code update:
 

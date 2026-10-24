@@ -114,14 +114,21 @@ installed_units() {
     return 0
 }
 
+# The collector starts only when the operator enabled it (disable --now stops it for good).
 start_all() {
+    local unit
     local units=()
-    while IFS= read -r unit; do units+=("$unit"); done \
-        < <(installed_units "${APP_SERVICES[@]}" kalshi-backup.timer kalshi-context-comparison.timer)
+    while IFS= read -r unit; do
+        if [[ "$unit" == kalshi-late-window.service ]] && ! systemctl is-enabled --quiet "$unit"; then
+            continue
+        fi
+        units+=("$unit")
+    done < <(installed_units "${APP_SERVICES[@]}" kalshi-backup.timer kalshi-context-comparison.timer)
     systemctl start "${units[@]}"
 }
 
 stop_all() {
+    local unit
     local units=()
     while IFS= read -r unit; do units+=("$unit"); done < <(installed_units "${ALL_UNITS[@]}")
     systemctl stop "${units[@]}"
@@ -158,6 +165,7 @@ wait_ready() {
 }
 
 rollback_on_error() {
+    local unit
     local status=$?
     local rollback_status=0
     local final_status=$status
