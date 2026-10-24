@@ -12,6 +12,7 @@ from contextlib import closing
 from pathlib import Path
 
 import backup_state
+import late_window
 from btc_predictor import OnlineLogisticRegression, new_state, state_transaction
 from forecast_archive import record_cycle
 
@@ -159,6 +160,39 @@ class BackupStateTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, error.decode())
         with tarfile.open(fileobj=io.BytesIO(output), mode="r:gz") as bundle:
             self.assertIn(destination.name + "/manifest.json", bundle.getnames())
+
+    def _make_store(self):
+        store = late_window.late_window_path(self.state_file)
+        late_window.connect_store(store).close()
+        return store
+
+    def test_backup_includes_late_window_store_when_present(self):
+        store = self._make_store()
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        manifest = backup_state.verify_backup(destination)
+        self.assertEqual(set(manifest["files"]), {"state", "archive", "late_window"})
+        self.assertEqual(manifest["files"]["late_window"]["name"], store.name)
+        self.assertTrue((destination / store.name).is_file())
+
+    def test_backup_without_store_still_verifies(self):
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        manifest = backup_state.verify_backup(destination)
+        self.assertEqual(set(manifest["files"]), {"state", "archive"})
+
+    def test_tampered_store_fails_verification(self):
+        store = self._make_store()
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        copied = destination / store.name
+        with closing(sqlite3.connect(copied)) as connection, connection:
+            connection.execute("UPDATE store_metadata SET value='2' WHERE key='schema_version'")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            backup_state.verify_backup(destination)
+        manifest_file = destination / "manifest.json"
+        manifest = json.loads(manifest_file.read_text())
+        manifest["files"]["late_window"]["sha256"] = backup_state._digest(copied)
+        manifest_file.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "late-window"):
+            backup_state.verify_backup(destination)
 
 
 if __name__ == "__main__":
