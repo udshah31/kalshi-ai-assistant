@@ -7,6 +7,7 @@ prices are used. Calibration is experimental and is never applied to live output
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -62,6 +63,7 @@ _COLUMNS = {
     "bars": (
         "product_id", "timestamp", "open", "high", "low", "close", "volume", "observed_at",
     ),
+    "candles": ("product_id", "timestamp", "close", "observed_at"),
 }
 
 TYPESAFE_STATUSES = frozenset({"ok", "error", "unavailable", "skipped", "disabled"})
@@ -459,6 +461,179 @@ def compare_context_models(
             "Both candidates use identical chronological test blocks and only prior-known labels for training.",
             "Market midpoint metrics use only frozen quote evidence valid at forecast issue time.",
             "A first scored fold is descriptive only; limited samples do not establish a winning model or trading profitability.",
+            "Descriptive offline comparison only; no live model, threshold, state, or trade gate is changed.",
+        ],
+    }
+
+
+MARKET_MODELS = ("candles_only", "market_only", "candles_plus_market", "strike_only", "market_plus_strike")
+MAX_CANDLE_AGE_SECONDS = 120
+
+
+def _issue_price(candles: Sequence[tuple[float, float, float]], issued_at: float) -> float | None:
+    """Latest BTC-USD minute close completed and received by issue time."""
+    best = None
+    for timestamp, close, observed in candles:
+        if timestamp + 60 > issued_at:
+            break
+        if observed <= issued_at and issued_at - (timestamp + 60) <= MAX_CANDLE_AGE_SECONDS:
+            best = close
+    return best
+
+
+def strike_distance(record: dict[str, Any], price: float | None) -> float | None:
+    """Volatility-scaled log distance from strike for the time left to close."""
+    strike = _number((record["snapshot"] or {}).get("target_price"))
+    remaining = record["closed_at"] - record["issued_at"]
+    if price is None or strike is None or strike <= 0 or price <= 0 or remaining <= 0:
+        return None
+    # Frozen 15m return volatility in percent; floored so a calm window cannot divide by ~0.
+    sigma = max(record["features"][4], .05) / 100 * math.sqrt(remaining / INTERVAL_SECONDS)
+    return _context_clamp(math.log(price / strike) / sigma, -5.0, 5.0)
+
+
+def _market_model_features(record: dict[str, Any]) -> dict[str, list[float]]:
+    market = [_logit(_context_clamp(record["market_midpoint"], .01, .99))]
+    strike = [record["strike_distance"]]
+    return {"candles_only": record["features"], "market_only": market,
+            "candles_plus_market": [*record["features"], *market],
+            "strike_only": strike, "market_plus_strike": [*market, *strike]}
+
+
+def compare_market_models(
+    path: str | Path,
+    train_size: int = 100,
+    test_size: int = 25,
+    epochs: int = 5,
+) -> dict[str, Any]:
+    """Test whether candle features add information beyond the issue-time market.
+
+    Uses only forecasts with frozen candle features and a fresh issue-time
+    midpoint. Folds, deduplication and prior-known-label rules match
+    ``compare_context_models``. Fresh models are compared with the raw midpoint
+    on identical rows. Descriptive offline experiment; nothing live changes.
+    """
+    for name, value in (("train_size", train_size), ("test_size", test_size), ("epochs", epochs)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    rows, schema_missing = _read_archive(Path(path))
+    settlement_map = {row["forecast_id"]: row for row in rows.get("settlements", [])}
+    official = []
+    for row in rows.get("forecasts", []):
+        forecast, _ = _forecast(row)
+        if forecast is None:
+            continue
+        forecast["settlement"], _ = _official_result(forecast, settlement_map.get(forecast["forecast_id"]))
+        forecast["market_midpoint"] = _market_midpoint(forecast)
+        official.append(forecast)
+    official.sort(key=lambda record: (record["issued_at"], record["forecast_id"]))
+    seen: set[str] = set()
+    unique = []
+    for record in official:
+        if record["market_ticker"] not in seen:
+            seen.add(record["market_ticker"])
+            unique.append(record)
+    candles = sorted((float(row["timestamp"]), float(row["close"]), float(row["observed_at"]))
+                     for row in rows.get("candles", [])
+                     if row["product_id"] == "BTC-USD" and all(_number(row[key]) is not None
+                                                                for key in ("timestamp", "close", "observed_at")))
+    starts = [candle[0] for candle in candles]
+    usable = []
+    for record in unique:
+        if record["features"] is None or record["market_midpoint"] is None:
+            continue
+        # Only candles that could have closed by issue time and within the age limit.
+        low = bisect.bisect_left(starts, record["issued_at"] - 60 - MAX_CANDLE_AGE_SECONDS)
+        record["strike_distance"] = strike_distance(record, _issue_price(candles[low:], record["issued_at"]))
+        if record["strike_distance"] is not None:
+            usable.append(record)
+
+    folds, all_predictions, skipped, delayed, cursor = [], [], 0, set(), 0
+    while cursor + test_size <= len(usable):
+        testing = usable[cursor:cursor + test_size]
+        block_start = testing[0]["issued_at"]
+        prior = [record for record in usable[:cursor]
+                 if record["settlement"] is not None and record["settlement"]["available_at"] < block_start]
+        delayed.update(record["forecast_id"] for record in usable[:cursor]
+                       if record["settlement"] is not None and record["settlement"]["available_at"] >= block_start)
+        if len(prior) < train_size:
+            skipped += 1
+            cursor += 1
+            continue
+        training = prior[-train_size:]
+        models = {name: OnlineLogisticRegression(n_features=len(_market_model_features(training[0])[name]))
+                  for name in MARKET_MODELS}
+        for _ in range(epochs):
+            for record in training:
+                features = _market_model_features(record)
+                for name, model in models.items():
+                    model.update(features[name], record["settlement"]["label"])
+        predictions = []
+        for record in testing:
+            features = _market_model_features(record)
+            prediction = {
+                "forecast_id": record["forecast_id"], "market_ticker": record["market_ticker"],
+                "issued_at": record["issued_at"],
+                "label": record["settlement"]["label"] if record["settlement"] else None,
+                "market_midpoint": record["market_midpoint"], "constant_50_percent": 0.5,
+            }
+            prediction.update({name: model.predict_proba(features[name]) for name, model in models.items()})
+            predictions.append(prediction)
+        values = [value for model in models.values() for value in (model.bias, *model.weights)]
+        values.extend(prediction[name] for prediction in predictions for name in MARKET_MODELS)
+        if not all(math.isfinite(value) for value in values):
+            folds.append({"status": "numerical_failure", "fold_index": len(folds), "block_start": block_start})
+            cursor += test_size
+            continue
+        folds.append({
+            "fold_index": len(folds), "block_start": block_start, "test_start_index": cursor,
+            "train": _boundaries(training), "test": _boundaries(testing),
+            "weights": {name: {"bias": model.bias, "weights": list(model.weights)} for name, model in models.items()},
+            "predictions": predictions,
+        })
+        all_predictions.extend(predictions)
+        cursor += test_size
+
+    candidates = (*MARKET_MODELS, "market_midpoint", "constant_50_percent")
+    metrics = {name: _comparison_metrics(all_predictions, name) for name in candidates}
+    market_brier = metrics["market_midpoint"]["brier_score"]
+    scored = sum(prediction["label"] is not None for prediction in all_predictions)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "descriptive_evaluation" if scored else "insufficient_data",
+        "configuration": {"train_size": train_size, "test_size": test_size, "epochs": epochs,
+                           "market_feature": "logit(yes midpoint clamped to [0.01, 0.99])",
+                           "strike_feature": "log(issue price / strike) / (15m volatility * sqrt(time left / 15m)), clamped to [-5, 5]",
+                           "max_candle_age_seconds": MAX_CANDLE_AGE_SECONDS,
+                           "candle_feature_names": list(FEATURE_NAMES)},
+        "coverage": {
+            "distinct_eligible_forecasts": len(unique),
+            "features_midpoint_and_strike_distance": len(usable),
+            "missing_frozen_features": sum(record["features"] is None for record in unique),
+            "missing_fresh_midpoint": sum(record["market_midpoint"] is None for record in unique),
+            "missing_fresh_issue_price_or_strike": sum(record.get("strike_distance", 0) is None for record in unique),
+            "walk_forward_tested": len(all_predictions),
+            "walk_forward_scored": scored,
+            "skipped_blocks_insufficient_known_history": skipped,
+            "delayed_labels_excluded_at_block_start": len(delayed),
+            "unused_tail_count": max(0, len(usable) - cursor),
+            "schema_missing": schema_missing,
+        },
+        "minimum_evidence_samples": MIN_LIVE_SAMPLES,
+        "additional_scored_samples_needed": max(0, MIN_LIVE_SAMPLES - scored),
+        "models": metrics,
+        "brier_minus_market_midpoint": {
+            name: (metrics[name]["brier_score"] - market_brier
+                   if metrics[name]["brier_score"] is not None and market_brier is not None else None)
+            for name in MARKET_MODELS
+        },
+        "folds": folds,
+        "limitations": [
+            "Only forecasts with frozen candle features and a fresh issue-time midpoint are used; all candidates share identical rows.",
+            "Negative brier_minus_market_midpoint means lower (better) Brier than the raw midpoint; it is not a trading return.",
+            "Midpoints are not executable prices: beating the midpoint does not cover the spread or the 3c cost allowance.",
+            "Quotes may be observed up to 120 seconds into the window and therefore include early intrawindow moves.",
             "Descriptive offline comparison only; no live model, threshold, state, or trade gate is changed.",
         ],
     }
@@ -1166,9 +1341,12 @@ def _atomic_output(path: Path, report: dict[str, Any], archive: Path) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "compare-context":
-        parser = argparse.ArgumentParser(description="Compare archived 15m/45m/3h and 15m/30m/1h contexts")
-        parser.add_argument("compare-context", help=argparse.SUPPRESS)
+    experiments = {"compare-context": ("Compare archived 15m/45m/3h and 15m/30m/1h contexts", compare_context_models),
+                   "compare-market": ("Compare candle, market-midpoint and combined models", compare_market_models)}
+    if arguments and arguments[0] in experiments:
+        description, experiment = experiments[arguments[0]]
+        parser = argparse.ArgumentParser(description=description)
+        parser.add_argument("experiment", help=argparse.SUPPRESS)
         parser.add_argument("--archive-file", required=True, type=Path)
         parser.add_argument("--output-json", type=Path)
         parser.add_argument("--train-size", type=int, default=100)
@@ -1176,7 +1354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--epochs", type=int, default=5)
         args = parser.parse_args(arguments)
         try:
-            report = compare_context_models(args.archive_file, args.train_size, args.test_size, args.epochs)
+            report = experiment(args.archive_file, args.train_size, args.test_size, args.epochs)
             if args.output_json:
                 _atomic_output(args.output_json, report, args.archive_file)
         except (OSError, sqlite3.Error, ValueError) as exc:
