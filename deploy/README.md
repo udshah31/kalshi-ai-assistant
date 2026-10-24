@@ -258,6 +258,11 @@ Stopping lets the current window finish and be written first. Backups and the
 export below include the store once it exists. A failed release, or a manual
 rollback to a release without it, stops and removes the unit again.
 
+The store grows by about 5 MB a day and is copied into each retained backup.
+After a rollback to a release from before the collector, `backup_state.py export`
+and `verify` reject the newer three-file backups until they age out of retention
+(about seven days); export older backups or roll forward instead.
+
 Inspect recent service logs or restart after a code update:
 
 ```bash
