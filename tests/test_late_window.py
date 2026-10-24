@@ -1,8 +1,9 @@
+import io
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 
 import late_window
@@ -145,6 +146,20 @@ class FakeTime:
     def sleep(self, seconds):
         self.now += seconds
 
+    def spawn(self, fn):
+        """Deterministic stand-in for a thread: fn may advance the clock to model its own duration."""
+        begun = self.now
+        result = fn()
+        finished, self.now = self.now, begun  # it ran concurrently, so the caller's clock is not held up
+
+        def join(timeout):
+            if finished <= self.now + timeout:
+                self.now = max(self.now, finished)
+                return result
+            self.now += max(0, timeout)
+            return None
+        return join
+
 
 class LateWindowCollectorTests(unittest.TestCase):
     def run_window(self, start=C - 700, stop=None, on_sample=None, snapshot=None):
@@ -167,7 +182,7 @@ class LateWindowCollectorTests(unittest.TestCase):
 
         window = late_window.collect_window(
             C, clock=t.clock, sleep=t.sleep, sample=sample, snapshot=snapshot or default_snapshot,
-            stop=stop or threading.Event())
+            stop=stop or threading.Event(), spawn=t.spawn)
         return window, calls
 
     def test_offsets_and_next_close(self):
@@ -179,7 +194,8 @@ class LateWindowCollectorTests(unittest.TestCase):
         window, calls = self.run_window()
         self.assertEqual(sum(c[0] == "sample" for c in calls), 121)
         self.assertEqual(sum(c[0] == "snapshot" for c in calls), 5)
-        self.assertLess(calls.index(("sample", -300)), calls.index(("snapshot", -300)))
+        self.assertIn(("sample", -300), calls)
+        self.assertIn(("snapshot", -300), calls)
         self.assertEqual(window["ticker"], "KXBTC15M-T")
         self.assertEqual(window["started_at"], C - 700)
         self.assertEqual(window["max_drift_seconds"], 0)
@@ -223,25 +239,72 @@ class LateWindowCollectorTests(unittest.TestCase):
         self.assertTrue(all(r["observed_at"] is None and r["ticker"] is None
                             for r in window["snapshots"] if r["error"] == "stopped"))
 
-    def test_slow_snapshot_turns_late_offsets_into_gaps(self):
+    def _timed_window(self, sample_seconds=None, snapshot_seconds=None):
         t = FakeTime(C - 700)
-        sampled = []
+        sampled = {}
 
         def sample(offset, close_ts):
-            sampled.append(offset)
+            sampled[offset] = t.now
+            t.now += (sample_seconds or {}).get(offset, 0)
             return late_window._gap_samples(offset, close_ts, None)
 
         def snapshot(offset, close_ts):
-            if offset == -15:
-                t.now += 20
+            t.now += (snapshot_seconds or {}).get(offset, 0)
+            return {**late_window._gap_snapshot(offset, close_ts, None), "ticker": "KXBTC15M-T"}
+
+        window = late_window.collect_window(C, clock=t.clock, sleep=t.sleep, sample=sample,
+                                            snapshot=snapshot, stop=threading.Event(), spawn=t.spawn)
+        return window, sampled
+
+    def test_slow_price_sample_does_not_make_its_snapshot_late(self):
+        window, _ = self._timed_window(sample_seconds={-30: 2.5})
+        self.assertEqual([r["error"] for r in window["snapshots"]], [None] * 5)
+        self.assertTrue(all(r["error"] is None for r in window["samples"]))
+
+    def test_slow_snapshot_times_out_and_later_offsets_stay_on_time(self):
+        window, sampled = self._timed_window(snapshot_seconds={-30: 20})
+        by = {r["offset_s"]: r["error"] for r in window["snapshots"]}
+        self.assertEqual(by, {-300: None, -120: None, -60: None, -30: "timeout", -15: None})
+        self.assertEqual(sampled[-25], C - 25)
+        self.assertEqual(sampled[-20], C - 20)
+        self.assertTrue(all(r["error"] is None for r in window["samples"]))
+        self.assertLessEqual(window["max_drift_seconds"], late_window.LATE_TOLERANCE_SECONDS)
+
+    def test_late_offset_gaps_both_kinds_without_calling_either(self):
+        t = FakeTime(C - 700)
+        called = []
+
+        def sample(offset, close_ts):
+            called.append(("sample", offset))
+            if offset == -35:
+                t.now += 8  # pushes C-30 past the tolerance
+            return late_window._gap_samples(offset, close_ts, None)
+
+        def snapshot(offset, close_ts):
+            called.append(("snapshot", offset))
             return late_window._gap_snapshot(offset, close_ts, None)
 
         window = late_window.collect_window(C, clock=t.clock, sleep=t.sleep, sample=sample,
-                                            snapshot=snapshot, stop=threading.Event())
-        for o in (-10, -5, 0):
-            self.assertNotIn(o, sampled)
-            self.assertEqual({r["error"] for r in window["samples"] if r["offset_s"] == o}, {"late"})
-        self.assertIn(-15, sampled)
+                                            snapshot=snapshot, stop=threading.Event(), spawn=t.spawn)
+        self.assertNotIn(("sample", -30), called)
+        self.assertNotIn(("snapshot", -30), called)
+        self.assertEqual({r["error"] for r in window["samples"] if r["offset_s"] == -30}, {"late"})
+        self.assertEqual([r["error"] for r in window["snapshots"] if r["offset_s"] == -30], ["late"])
+
+    def test_run_in_thread_returns_none_after_deadline(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.assertEqual(late_window.run_in_thread(lambda: {"ok": 1})(1.0), {"ok": 1})
+        started = time.monotonic()
+        self.assertIsNone(late_window.run_in_thread(lambda: release.wait(10) and {})(0.1))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_window_log_line(self):
+        window = make_window(C, failing={("kraken", -300)}, snapshot_errors={-15, -30})
+        self.assertEqual(late_window.window_log_line(window, True, 2),
+                         "window close=2027-01-15T08:15:00Z written sample_gaps=1 snapshot_gaps=2"
+                         " max_drift=0.20s finalized=2")
+        self.assertIn(" skipped ", late_window.window_log_line(window, False, 0))
 
     def test_all_gap_window_has_no_evidence(self):
         gaps = late_window.collect_window(C, clock=FakeTime(C + 5).clock, sleep=lambda s: None,
@@ -296,7 +359,8 @@ class LateWindowFinalizeTests(unittest.TestCase):
                 raise OSError("down")
             return self.market(t, 1900)
 
-        self.assertEqual(self.run_finalize(fetch), 1)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_finalize(fetch), 1)
         self.assertEqual(self.db.execute("SELECT ticker FROM official_values").fetchall(), [("T2",)])
         self.assertEqual(self.run_finalize(lambda t: self.market(t, 1000)), 1)
 
@@ -306,6 +370,27 @@ class LateWindowFinalizeTests(unittest.TestCase):
         seen = []
         self.assertEqual(self.run_finalize(lambda t: seen.append(t) or self.market(t, int(t[1:])), limit=3), 3)
         self.assertEqual(seen, ["T1000", "T1900", "T2800"])
+
+    def test_old_unfinalizable_windows_do_not_block_recent_ones(self):
+        now = 2_000_000_000.0
+        for c in (now - 4 * 86400, now - 3.5 * 86400, now - 3 * 86400 - 1):
+            self.add(int(c), f"OLD{int(c)}")
+        self.add(int(now - 900), "RECENT")
+        seen = []
+        n = late_window.finalize_pending(self.db, lambda t: seen.append(t) or self.market(t, int(now - 900)), now,
+                                         limit=3)
+        self.assertEqual((seen, n), (["RECENT"], 1))
+        self.assertEqual(late_window.finalize_pending.__defaults__, (6,))
+
+    def test_finalize_exception_is_logged_and_swallowed(self):
+        self.add(1000, "T1")
+
+        def fetch(t):
+            raise OSError("down")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.run_finalize(fetch), 0)
+        self.assertEqual(out.getvalue(), "finalize T1: OSError: down\n")
 
     def test_missing_values_ticker_null_and_too_recent_are_skipped(self):
         self.add(1000, "T1")

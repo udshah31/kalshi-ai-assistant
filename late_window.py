@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -200,6 +201,7 @@ def proxy_mid(rows: list[dict]) -> float | None:
 PRICE_OFFSETS = range(-600, 1, 5)
 SNAPSHOT_OFFSETS = (-300, -120, -60, -30, -15)
 LATE_TOLERANCE_SECONDS = 2.0
+SNAPSHOT_DEADLINE_SECONDS = 4.0
 QUOTE_FIELDS = ("yes_bid", "yes_ask", "yes_ask_size", "no_bid", "no_ask", "no_ask_size")
 
 
@@ -233,10 +235,27 @@ def _gap_snapshot(offset_s: int, close_ts: int, error: str) -> dict:
             "observed_at": None, "error": error}
 
 
+def run_in_thread(fn: Callable[[], dict]) -> Callable[[float], dict | None]:
+    """Start fn on a daemon thread; the returned join(timeout) gives its result, or None if unfinished."""
+    box: list[dict] = []
+    thread = threading.Thread(target=lambda: box.append(fn()), daemon=True)
+    thread.start()
+
+    def join(timeout: float) -> dict | None:
+        thread.join(max(0.0, timeout))  # an unfinished thread is abandoned, never waited on again
+        return box[0] if box else None
+    return join
+
+
 def collect_window(close_ts: int, *, clock: Callable[[], float], sleep: Callable[[float], None],
                    sample: Callable[[int, int], list[dict]], snapshot: Callable[[int, int], dict],
-                   stop: threading.Event) -> dict:
-    """Walk every offset on the wall clock; skipped offsets become gap rows so the window is complete."""
+                   stop: threading.Event,
+                   spawn: Callable[[Callable[[], dict]], Callable[[float], dict | None]] = run_in_thread) -> dict:
+    """Walk every offset on the wall clock; skipped offsets become gap rows so the window is complete.
+
+    Lateness is measured once per offset, before any call. A snapshot runs concurrently with the price
+    sample at the same offset and becomes an error="timeout" gap if not done within SNAPSHOT_DEADLINE_SECONDS.
+    """
     started = clock()
     samples: list[dict] = []
     snapshots: list[dict] = []
@@ -247,17 +266,23 @@ def collect_window(close_ts: int, *, clock: Callable[[], float], sleep: Callable
         if error is None:
             sleep(max(0, target - clock()))
             error = "stopped" if stop.is_set() else None
-        for kind in ("price", "snapshot"):
-            if kind == "price" and offset not in PRICE_OFFSETS or kind == "snapshot" and offset not in SNAPSHOT_OFFSETS:
-                continue
-            late = clock() - target
-            row_error = error or ("late" if late > LATE_TOLERANCE_SECONDS else None)
-            if row_error is None:
-                drift = max(drift, late)
-            if kind == "price":
-                samples.extend(_gap_samples(offset, close_ts, row_error) if row_error else sample(offset, close_ts))
-            else:
-                snapshots.append(_gap_snapshot(offset, close_ts, row_error) if row_error else snapshot(offset, close_ts))
+        begun = clock()
+        if error is None and begun - target > LATE_TOLERANCE_SECONDS:
+            error = "late"
+        wants_price, wants_snapshot = offset in PRICE_OFFSETS, offset in SNAPSHOT_OFFSETS
+        if error:
+            if wants_price:
+                samples.extend(_gap_samples(offset, close_ts, error))
+            if wants_snapshot:
+                snapshots.append(_gap_snapshot(offset, close_ts, error))
+            continue
+        drift = max(drift, begun - target)
+        join = spawn(lambda o=offset: snapshot(o, close_ts)) if wants_snapshot else None
+        if wants_price:
+            samples.extend(sample(offset, close_ts))
+        if join is not None:
+            row = join(SNAPSHOT_DEADLINE_SECONDS - (clock() - begun))
+            snapshots.append(row if row is not None else _gap_snapshot(offset, close_ts, "timeout"))
     ticker = next((r["ticker"] for r in snapshots if r["error"] is None), None)
     return {"close_ts": close_ts, "ticker": ticker, "started_at": started, "max_drift_seconds": drift,
             "samples": samples, "snapshots": snapshots}
@@ -267,6 +292,14 @@ def has_evidence(window: dict) -> bool:
     return any(r["error"] is None for r in window["samples"] + window["snapshots"])
 
 
+def window_log_line(window: dict, written: bool, finalized: int) -> str:
+    close = datetime.fromtimestamp(window["close_ts"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (f"window close={close} {'written' if written else 'skipped'}"
+            f" sample_gaps={sum(r['error'] is not None for r in window['samples'])}"
+            f" snapshot_gaps={sum(r['error'] is not None for r in window['snapshots'])}"
+            f" max_drift={window['max_drift_seconds']:.2f}s finalized={finalized}")
+
+
 def run_collector(state_file: str | Path, series: str, stop: threading.Event) -> None:
     with closing(connect_store(late_window_path(state_file))) as connection:
         while not stop.is_set():
@@ -274,19 +307,24 @@ def run_collector(state_file: str | Path, series: str, stop: threading.Event) ->
                 next_close(time.time()), clock=time.time, sleep=stop.wait, stop=stop, sample=sample_prices,
                 snapshot=lambda o, c: snapshot_quote(o, c, lambda: fetch_kalshi_market(series, timeout=3)))
             # first write wins, so never let an evidence-free window block a later full one
-            if has_evidence(window):
-                write_window(connection, window)
+            written = has_evidence(window) and write_window(connection, window)
+            finalized = 0
             if not stop.is_set():
-                finalize_pending(connection, fetch_kalshi_market_by_ticker, time.time())
+                finalized = finalize_pending(connection, fetch_kalshi_market_by_ticker, time.time())
+            print(window_log_line(window, written, finalized), flush=True)
+
+
+FINALIZE_LOOKBACK_SECONDS = 3 * 86400
 
 
 def finalize_pending(connection: sqlite3.Connection, fetch_by_ticker: Callable[[str], dict], now: float,
-                     limit: int = 3) -> int:
-    """Record official strike/expiration values for settled windows; failures retry next cycle."""
+                     limit: int = 6) -> int:
+    """Record official values for settled windows of the last 3 days, oldest first; failures retry next cycle."""
     pending = connection.execute(
         "SELECT w.ticker, w.close_ts FROM windows w LEFT JOIN official_values o ON o.ticker = w.ticker"
-        " WHERE w.ticker IS NOT NULL AND w.close_ts <= ? AND o.ticker IS NULL ORDER BY w.close_ts LIMIT ?",
-        (now - 30, limit)).fetchall()
+        " WHERE w.ticker IS NOT NULL AND w.close_ts <= ? AND w.close_ts >= ? AND o.ticker IS NULL"
+        " ORDER BY w.close_ts LIMIT ?",
+        (now - 30, now - FINALIZE_LOOKBACK_SECONDS, limit)).fetchall()
     recorded = 0
     for ticker, close_ts in pending:
         try:
@@ -300,8 +338,8 @@ def finalize_pending(connection: sqlite3.Connection, fetch_by_ticker: Callable[[
                 "ticker": ticker, "close_ts": close_ts, "target_price": target, "expiration_value": expiration,
                 "result": market["result"], "settled_at": timestamp_seconds(market["settlement_time"]),
                 "observed_at": now})
-        except Exception:
-            continue
+        except Exception as exc:  # logged and retried next cycle, never a crash
+            print(f"finalize {ticker}: {type(exc).__name__}: {exc}"[:200], flush=True)
     return recorded
 
 
