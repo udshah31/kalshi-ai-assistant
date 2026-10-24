@@ -249,3 +249,70 @@ class LateWindowCollectorTests(unittest.TestCase):
         self.assertFalse(late_window.has_evidence(gaps))
         gaps["samples"][0] = {**gaps["samples"][0], "error": None}
         self.assertTrue(late_window.has_evidence(gaps))
+
+
+class LateWindowFinalizeTests(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        self.db = late_window.connect_store(Path(d.name) / "lw.sqlite3")
+        self.addCleanup(self.db.close)
+        self.now = 10_000.0
+
+    def add(self, close_ts, ticker):
+        w = make_window(close_ts)
+        w["ticker"] = ticker
+        late_window.write_window(self.db, w)
+
+    def market(self, ticker, close_ts, **over):
+        m = {"ticker": ticker, "status": "finalized", "result": "yes", "close_time": close_ts,
+             "settlement_time": close_ts + 5, "target_price": 82800.0, "expiration_value": "82813.54"}
+        m.update(over)
+        return m
+
+    def run_finalize(self, fetch, **kw):
+        return late_window.finalize_pending(self.db, fetch, self.now, **kw)
+
+    def test_finalized_market_is_recorded(self):
+        self.add(1000, "T1")
+        n = self.run_finalize(lambda t: self.market(t, 1000))
+        self.assertEqual(n, 1)
+        row = self.db.execute("SELECT ticker,close_ts,target_price,expiration_value,result,settled_at,observed_at"
+                              " FROM official_values").fetchone()
+        self.assertEqual(row, ("T1", 1000, 82800.0, 82813.54, "yes", 1005.0, self.now))
+
+    def test_provisional_result_is_not_official(self):
+        self.add(1000, "T1")
+        self.assertEqual(self.run_finalize(lambda t: self.market(t, 1000, status="determined")), 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM official_values").fetchone()[0], 0)
+        self.assertEqual(self.run_finalize(lambda t: self.market(t, 1000)), 1)
+
+    def test_fetch_error_leaves_window_pending(self):
+        self.add(1000, "T1")
+        self.add(1900, "T2")
+
+        def fetch(t):
+            if t == "T1":
+                raise OSError("down")
+            return self.market(t, 1900)
+
+        self.assertEqual(self.run_finalize(fetch), 1)
+        self.assertEqual(self.db.execute("SELECT ticker FROM official_values").fetchall(), [("T2",)])
+        self.assertEqual(self.run_finalize(lambda t: self.market(t, 1000)), 1)
+
+    def test_limit_and_oldest_first(self):
+        for i, c in enumerate((3700, 1000, 2800, 1900)):
+            self.add(c, f"T{c}")
+        seen = []
+        self.assertEqual(self.run_finalize(lambda t: seen.append(t) or self.market(t, int(t[1:])), limit=3), 3)
+        self.assertEqual(seen, ["T1000", "T1900", "T2800"])
+
+    def test_missing_values_ticker_null_and_too_recent_are_skipped(self):
+        self.add(1000, "T1")
+        self.add(1900, None)
+        self.add(self.now - 10, "T3")
+        self.assertEqual(self.run_finalize(lambda t: self.market(t, 1000, expiration_value=None)), 0)
+        self.assertEqual(self.run_finalize(lambda t: self.market(t, 1000, target_price=0)), 0)
+        seen = []
+        self.run_finalize(lambda t: seen.append(t) or self.market(t, 1000))
+        self.assertEqual(seen, ["T1"])

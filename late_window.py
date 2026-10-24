@@ -18,7 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
-from btc_predictor import DEFAULT_KALSHI_SERIES, INTERVAL_SECONDS, fetch_kalshi_market, timestamp_seconds
+from btc_predictor import (DEFAULT_KALSHI_SERIES, INTERVAL_SECONDS, fetch_kalshi_market,
+                           fetch_kalshi_market_by_ticker, is_finalized_result, optional_number, timestamp_seconds)
 
 # ---- storage -------------------------------------------------------------
 SCHEMA_VERSION = "1"
@@ -275,6 +276,33 @@ def run_collector(state_file: str | Path, series: str, stop: threading.Event) ->
             # first write wins, so never let an evidence-free window block a later full one
             if has_evidence(window):
                 write_window(connection, window)
+            if not stop.is_set():
+                finalize_pending(connection, fetch_kalshi_market_by_ticker, time.time())
+
+
+def finalize_pending(connection: sqlite3.Connection, fetch_by_ticker: Callable[[str], dict], now: float,
+                     limit: int = 3) -> int:
+    """Record official strike/expiration values for settled windows; failures retry next cycle."""
+    pending = connection.execute(
+        "SELECT w.ticker, w.close_ts FROM windows w LEFT JOIN official_values o ON o.ticker = w.ticker"
+        " WHERE w.ticker IS NOT NULL AND w.close_ts <= ? AND o.ticker IS NULL ORDER BY w.close_ts LIMIT ?",
+        (now - 30, limit)).fetchall()
+    recorded = 0
+    for ticker, close_ts in pending:
+        try:
+            market = fetch_by_ticker(ticker)
+            if not is_finalized_result(market, ticker, close_ts, now):
+                continue
+            target, expiration = optional_number(market["target_price"]), optional_number(market["expiration_value"])
+            if not (target and target > 0 and expiration and expiration > 0):
+                continue
+            recorded += record_official(connection, {
+                "ticker": ticker, "close_ts": close_ts, "target_price": target, "expiration_value": expiration,
+                "result": market["result"], "settled_at": timestamp_seconds(market["settlement_time"]),
+                "observed_at": now})
+        except Exception:
+            continue
+    return recorded
 
 
 def main() -> int:
