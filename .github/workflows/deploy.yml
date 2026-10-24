@@ -103,6 +103,14 @@ jobs:
           name: kalshi-release
           path: dist
 
+      # SSH is not reachable from GitHub runners on the public IP; deploy over the tailnet.
+      - name: Join tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
       - name: Configure strict SSH
         env:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}

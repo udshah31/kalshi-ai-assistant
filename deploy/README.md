@@ -373,11 +373,19 @@ at least one required reviewer. Add these environment secrets without committing
 them to the repository:
 
 ```text
-ORACLE_HOST              # public IP or hostname
+ORACLE_HOST              # the VM's Tailscale IPv4 address (100.x)
 ORACLE_USER              # normally ubuntu
 ORACLE_SSH_PRIVATE_KEY   # complete private-key value
-ORACLE_KNOWN_HOSTS       # reviewed ssh-keyscan output
+ORACLE_KNOWN_HOSTS       # reviewed ssh-keyscan output for the Tailscale address
+TS_OAUTH_CLIENT_ID       # Tailscale OAuth client with the auth_keys scope
+TS_OAUTH_SECRET          # its secret
 ```
+
+SSH on the public IP is not reachable from GitHub runners, so the deploy job joins
+the tailnet as an ephemeral `tag:ci` node first. In the Tailscale admin console,
+declare `tag:ci` under `tagOwners`, create an OAuth client with the `auth_keys`
+scope and tag `tag:ci`, and make sure the access policy lets `tag:ci` reach the VM
+on port 22. Each run's node is removed automatically after the job.
 
 To prepare `ORACLE_KNOWN_HOSTS`, verify the VM fingerprint through the Oracle
 console or an independent channel, then save the reviewed host-key lines. Do not
