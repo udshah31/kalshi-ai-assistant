@@ -468,6 +468,50 @@ def compare_context_models(
 
 MARKET_MODELS = ("candles_only", "market_only", "candles_plus_market", "strike_only", "market_plus_strike")
 MAX_CANDLE_AGE_SECONDS = 120
+FIT_PENALTY = .001
+
+
+def _normal_cdf(value: float) -> float:
+    return .5 * (1 + math.erf(value / math.sqrt(2)))
+
+
+def _fit_logistic(rows: Sequence[Sequence[float]], labels: Sequence[int],
+                  penalty: float = FIT_PENALTY, iterations: int = 50) -> OnlineLogisticRegression:
+    """Fit logistic regression to convergence by Newton steps (IRLS).
+
+    Minimizes mean log loss plus a small L2 penalty, so a few hundred SGD updates
+    no longer leave the weights shrunk toward zero. The penalty keeps single-class
+    or separable blocks finite and the Newton system nonsingular.
+    """
+    size = len(rows[0]) + 1
+    beta = [0.0] * size
+    for _ in range(iterations):
+        gradient = [penalty * value for value in beta]
+        hessian = [[penalty * (i == j) for j in range(size)] for i in range(size)]
+        for row, label in zip(rows, labels):
+            x = (1.0, *row)
+            probability = OnlineLogisticRegression._sigmoid(sum(b * v for b, v in zip(beta, x)))
+            residual, weight = (probability - label) / len(labels), probability * (1 - probability) / len(labels)
+            for i in range(size):
+                gradient[i] += residual * x[i]
+                for j in range(size):
+                    hessian[i][j] += weight * x[i] * x[j]
+        # Gaussian elimination with partial pivoting.
+        system = [hessian[i] + [gradient[i]] for i in range(size)]
+        for column in range(size):
+            pivot = max(range(column, size), key=lambda r: abs(system[r][column]))
+            system[column], system[pivot] = system[pivot], system[column]
+            for r in range(column + 1, size):
+                factor = system[r][column] / system[column][column]
+                for c in range(column, size + 1):
+                    system[r][c] -= factor * system[column][c]
+        step = [0.0] * size
+        for i in reversed(range(size)):
+            step[i] = (system[i][size] - sum(system[i][j] * step[j] for j in range(i + 1, size))) / system[i][i]
+        beta = [b - s for b, s in zip(beta, step)]
+        if max(abs(s) for s in step) < 1e-9:
+            break
+    return OnlineLogisticRegression(n_features=size - 1, weights=beta[1:], bias=beta[0])
 
 
 def _issue_price(candles: Sequence[tuple[float, float, float]], issued_at: float) -> float | None:
@@ -504,16 +548,16 @@ def compare_market_models(
     path: str | Path,
     train_size: int = 100,
     test_size: int = 25,
-    epochs: int = 5,
 ) -> dict[str, Any]:
     """Test whether candle features add information beyond the issue-time market.
 
     Uses only forecasts with frozen candle features and a fresh issue-time
     midpoint. Folds, deduplication and prior-known-label rules match
     ``compare_context_models``. Fresh models are compared with the raw midpoint
-    on identical rows. Descriptive offline experiment; nothing live changes.
+    on identical rows. ``strike_formula`` is Phi(strike distance) with no fitted
+    parameters. Descriptive offline experiment; nothing live changes.
     """
-    for name, value in (("train_size", train_size), ("test_size", test_size), ("epochs", epochs)):
+    for name, value in (("train_size", train_size), ("test_size", test_size)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
     rows, schema_missing = _read_archive(Path(path))
@@ -561,13 +605,10 @@ def compare_market_models(
             cursor += 1
             continue
         training = prior[-train_size:]
-        models = {name: OnlineLogisticRegression(n_features=len(_market_model_features(training[0])[name]))
+        training_features = [_market_model_features(record) for record in training]
+        labels = [record["settlement"]["label"] for record in training]
+        models = {name: _fit_logistic([features[name] for features in training_features], labels)
                   for name in MARKET_MODELS}
-        for _ in range(epochs):
-            for record in training:
-                features = _market_model_features(record)
-                for name, model in models.items():
-                    model.update(features[name], record["settlement"]["label"])
         predictions = []
         for record in testing:
             features = _market_model_features(record)
@@ -576,6 +617,7 @@ def compare_market_models(
                 "issued_at": record["issued_at"],
                 "label": record["settlement"]["label"] if record["settlement"] else None,
                 "market_midpoint": record["market_midpoint"], "constant_50_percent": 0.5,
+                "strike_formula": _normal_cdf(record["strike_distance"]),
             }
             prediction.update({name: model.predict_proba(features[name]) for name, model in models.items()})
             predictions.append(prediction)
@@ -594,7 +636,7 @@ def compare_market_models(
         all_predictions.extend(predictions)
         cursor += test_size
 
-    candidates = (*MARKET_MODELS, "market_midpoint", "constant_50_percent")
+    candidates = (*MARKET_MODELS, "strike_formula", "market_midpoint", "constant_50_percent")
     metrics = {name: _comparison_metrics(all_predictions, name) for name in candidates}
     market_brier = metrics["market_midpoint"]["brier_score"]
     scored = sum(prediction["label"] is not None for prediction in all_predictions)
@@ -602,7 +644,9 @@ def compare_market_models(
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "descriptive_evaluation" if scored else "insufficient_data",
-        "configuration": {"train_size": train_size, "test_size": test_size, "epochs": epochs,
+        "configuration": {"train_size": train_size, "test_size": test_size,
+                           "fit": f"Newton (IRLS) to convergence; L2 penalty {FIT_PENALTY} on mean log loss",
+                           "strike_formula": "Phi(strike feature); no fitted parameters",
                            "market_feature": "logit(yes midpoint clamped to [0.01, 0.99])",
                            "strike_feature": "log(issue price / strike) / (15m volatility * sqrt(time left / 15m)), clamped to [-5, 5]",
                            "max_candle_age_seconds": MAX_CANDLE_AGE_SECONDS,
@@ -626,7 +670,7 @@ def compare_market_models(
         "brier_minus_market_midpoint": {
             name: (metrics[name]["brier_score"] - market_brier
                    if metrics[name]["brier_score"] is not None and market_brier is not None else None)
-            for name in MARKET_MODELS
+            for name in (*MARKET_MODELS, "strike_formula")
         },
         "folds": folds,
         "limitations": [
@@ -1351,10 +1395,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--output-json", type=Path)
         parser.add_argument("--train-size", type=int, default=100)
         parser.add_argument("--test-size", type=int, default=25)
-        parser.add_argument("--epochs", type=int, default=5)
+        if experiment is compare_context_models:
+            parser.add_argument("--epochs", type=int, default=5)
         args = parser.parse_args(arguments)
         try:
-            report = experiment(args.archive_file, args.train_size, args.test_size, args.epochs)
+            report = experiment(args.archive_file, args.train_size, args.test_size,
+                                *([args.epochs] if experiment is compare_context_models else []))
             if args.output_json:
                 _atomic_output(args.output_json, report, args.archive_file)
         except (OSError, sqlite3.Error, ValueError) as exc:

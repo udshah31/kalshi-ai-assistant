@@ -286,7 +286,11 @@ It fits fresh `candles_only`, `market_only` (logit of the frozen YES midpoint),
 same chronological folds and prior-known-label rules. The strike feature is
 log(issue price / strike) scaled by frozen 15m volatility and time left, where
 the issue price is the latest BTC-USD minute close completed and received by
-issue time, at most 120 seconds old. All models use identical forecasts that
+issue time, at most 120 seconds old. Each fold fits these models to convergence
+(Newton/IRLS with a small L2 penalty), not with a few SGD epochs, so it takes no
+`--epochs` option. A sixth, untrained `strike_formula` candidate is
+Phi(strike feature): the normal probability of finishing above the strike.
+All candidates use identical forecasts that
 have frozen features, a fresh issue-time midpoint and a strike distance. `brier_minus_market_midpoint` compares each
 with the raw midpoint; negative is better. A midpoint is not an executable
 price, so beating it does not cover the spread or cost allowance. Not scheduled
