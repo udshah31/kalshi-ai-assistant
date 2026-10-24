@@ -135,7 +135,9 @@ The dashboard shows **TRADE NOW** only for a paper candidate that passes all che
   valid settlement timestamp. Provisional results, legacy proxy matches and late
   forecasts do not satisfy this preliminary gate.
   On ≥20 official samples, rolling accuracy must be ≥50% and Brier must beat the
-  constant-50% baseline of 0.250. The app reports reliability bins without claiming
+  constant-50% baseline of 0.250. Brier must also be strictly lower than the
+  issue-time Kalshi midpoint's on the same rolling samples, with at least 20
+  exact-ticker quotes observed ≤60 seconds before issue. The app reports reliability bins without claiming
   that the probabilities have been calibrated.
 - If configured, a current TypeSafe approval for the exact candidate.
 
