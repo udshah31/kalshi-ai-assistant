@@ -122,8 +122,10 @@ restore_units() {
             install -o root -g root -m 0644 "$source/$unit" "$SYSTEMD_ROOT/$unit" || return 1
         else
             # Unit absent from that release: stop it for good and remove it.
-            systemctl disable --now "$unit" >/dev/null 2>&1
-            rm -f -- "$SYSTEMD_ROOT/$unit" || return 1
+            if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then
+                systemctl disable --now "$unit" >/dev/null 2>&1 || true
+                rm -f -- "$SYSTEMD_ROOT/$unit" || return 1
+            fi
         fi
     done
 }

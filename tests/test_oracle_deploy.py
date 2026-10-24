@@ -1,3 +1,4 @@
+import re
 import subprocess
 import os
 import tempfile
@@ -100,7 +101,7 @@ class OracleDeployScriptTests(unittest.TestCase):
         self.assertIn("NEW_UNITS=(kalshi-late-window.service)", script)
         self.assertIn('if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then\n        install', script)
         self.assertIn('if [[ -f "$ROLLBACK_UNITS/$unit" ]]; then', script)
-        self.assertIn('systemctl disable "$unit"', script)
+        self.assertIn('systemctl disable --now "$unit"', script)
         self.assertIn('rm -f -- "$SYSTEMD_ROOT/$unit"', script)
         self.assertIn("installed_units", script.split("stop_all() {")[1].split("}")[0])
         self.assertIn("installed_units", script.split("start_all() {")[1].split("}")[0])
@@ -113,6 +114,41 @@ class OracleDeployScriptTests(unittest.TestCase):
             self.assertRegex(start, r"kalshi-late-window\.service.*is-enabled --quiet")
             self.assertRegex(script, r"NEW_UNITS=\(kalshi-late-window\.service\)")
             self.assertRegex(script.split("stop_all() {")[1].split("\n}\n")[0], r"installed_units")
+
+    @staticmethod
+    def _function(path, name):
+        text = Path(path).read_text(encoding="utf-8")
+        match = re.search(rf"^{name}\(\) \{{\n(.*?)^\}}\n", text, re.S | re.M)
+        assert match, name
+        return match.group(0)
+
+    def test_rollback_on_error_captures_failing_status(self):
+        for path in (CONTAINER_SCRIPT, ROLLBACK_SCRIPT.parent / "oracle-rollback.sh", SCRIPT):
+            body = self._function(path, "rollback_on_error").splitlines()[1]
+            self.assertEqual(body.strip(), "local status=$?", path.name)
+        # behaviour: the capture pattern only works as the first statement
+        result = subprocess.run(
+            ["bash", "-c", 'f() { local status=$?; echo "$status"; }; false; f'],
+            text=True, capture_output=True)
+        self.assertEqual(result.stdout.strip(), "1")
+
+    def test_manual_rollback_removes_absent_unit_without_aborting(self):
+        script = ROLLBACK_SCRIPT.parent / "oracle-rollback.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "target").mkdir()
+            (Path(tmp) / "systemd").mkdir()
+            snippet = "\n".join([
+                "set -Eeuo pipefail",
+                f'SYSTEMD_ROOT="{tmp}/systemd"',
+                'ALL_UNITS=(kalshi-late-window.service)',
+                'systemctl() { return 1; }',
+                self._function(script, "restore_units"),
+                f'restore_units "{tmp}/target"',
+                "echo done",
+            ])
+            result = subprocess.run(["bash", "-c", snippet], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("done", result.stdout)
 
     def test_manual_rollback_disables_and_removes_unit_missing_from_target(self):
         script = (ROOT / "deploy/oracle-rollback.sh").read_text(encoding="utf-8")

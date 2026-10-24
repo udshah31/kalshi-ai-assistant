@@ -165,8 +165,8 @@ wait_ready() {
 }
 
 rollback_on_error() {
-    local unit
     local status=$?
+    local unit
     local rollback_status=0
     local final_status=$status
     trap - EXIT
@@ -183,7 +183,7 @@ rollback_on_error() {
                 install -o root -g root -m 0644 "$ROLLBACK_UNITS/$unit" "$SYSTEMD_ROOT/$unit" || rollback_status=1
             else
                 # Unit did not exist in the previous release: do not leave it behind.
-                systemctl disable "$unit" >/dev/null 2>&1
+                systemctl disable --now "$unit" >/dev/null 2>&1 || true
                 rm -f -- "$SYSTEMD_ROOT/$unit" || rollback_status=1
             fi
         done
