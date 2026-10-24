@@ -482,13 +482,15 @@ def fetch_kalshi_market_by_ticker(ticker: str, timeout: int = 10) -> dict[str, A
 
 def _fetch_kalshi_markets(
     series_ticker: str,
-    status: str,
+    status: str | None,
     limit: int = 20,
     timeout: int = 15,
+    **filters: int,
 ) -> list[dict[str, Any]]:
-    params = urllib.parse.urlencode(
-        {"series_ticker": series_ticker, "status": status, "limit": limit}
-    )
+    query = {"series_ticker": series_ticker, "limit": limit, **filters}
+    if status is not None:
+        query["status"] = status
+    params = urllib.parse.urlencode(query)
     url = f"https://api.elections.kalshi.com/trade-api/v2/markets?{params}"
     request = urllib.request.Request(
         url,
@@ -510,8 +512,13 @@ def fetch_kalshi_market(
     """Fetch the nearest active market from Kalshi's public market API."""
 
     now = time.time()
-    active = [m for m in _fetch_kalshi_markets(series_ticker, "open", timeout=timeout)
-              if (timestamp_seconds(m.get("open_time")) or float("inf")) <= now
+    # Kalshi's status=open filter stopped returning trading markets (seen 2026-10-24),
+    # so select by close time and keep only the window open right now.
+    candidates = _fetch_kalshi_markets(series_ticker, None, timeout=timeout,
+                                       min_close_ts=int(now), max_close_ts=int(now) + 2 * INTERVAL_SECONDS)
+    active = [m for m in candidates
+              if m.get("status") in {"active", "open"}
+              and (timestamp_seconds(m.get("open_time")) or float("inf")) <= now
               < (timestamp_seconds(m.get("close_time")) or 0)]
     if not active:
         return None

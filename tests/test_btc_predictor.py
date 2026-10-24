@@ -1,7 +1,10 @@
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 from btc_predictor import (
     FEATURE_NAMES,
@@ -13,6 +16,7 @@ from btc_predictor import (
     demo_account_summary,
     evaluate_trade_signal,
     feature_vector,
+    fetch_kalshi_market,
     learn_from_pending,
     learning_analysis,
     learning_freshness,
@@ -290,6 +294,46 @@ class PredictorTests(unittest.TestCase):
         self.assertEqual(model.n_features, len(FEATURE_NAMES))
         self.assertEqual(metrics["samples"], 10.0)
         self.assertGreaterEqual(metrics["accuracy"], 0.8)
+
+
+class ActiveMarketLookupTests(unittest.TestCase):
+    # Kalshi's status=open filter stopped returning trading KXBTC15M markets (2026-10-24);
+    # the lookup must find them by close time instead.
+    NOW = 1792863000.0 + 125  # 2026-10-24T17:32:05Z, inside the 17:30-17:45 window
+
+    def respond(self, request, timeout=None):
+        url = request if isinstance(request, str) else request.full_url
+        self.urls.append(url)
+        if url.endswith("/orderbook"):
+            payload = {"orderbook_fp": {"yes_dollars": [["0.21", "500"]], "no_dollars": [["0.78", "400"]]}}
+        else:
+            payload = {"markets": [
+                {"ticker": "KXBTC15M-26OCT241400-00", "status": "initialized",
+                 "open_time": "2026-10-24T17:45:00Z", "close_time": "2026-10-24T18:00:00Z"},
+                {"ticker": "KXBTC15M-26OCT241345-45", "status": "active",
+                 "open_time": "2026-10-24T17:30:00Z", "close_time": "2026-10-24T17:45:00Z"},
+            ]}
+        return io.BytesIO(json.dumps(payload).encode())
+
+    def test_finds_trading_market_by_close_time_without_status_filter(self):
+        self.urls = []
+        with patch("btc_predictor.time.time", return_value=self.NOW), \
+                patch("btc_predictor.urllib.request.urlopen", side_effect=self.respond):
+            market = fetch_kalshi_market("KXBTC15M")
+        self.assertEqual(market["ticker"], "KXBTC15M-26OCT241345-45")
+        self.assertEqual(market["quote_source"], "kalshi_orderbook")
+        query = parse_qs(urlparse(self.urls[0]).query)
+        self.assertNotIn("status", query)
+        self.assertEqual(query["series_ticker"], ["KXBTC15M"])
+        self.assertEqual(query["min_close_ts"], [str(int(self.NOW))])
+
+    def test_market_not_yet_trading_is_ignored(self):
+        self.urls = []
+        before_open = 1792863000.0 - 10  # 17:29:50Z: neither returned market has opened yet
+        with patch("btc_predictor.time.time", return_value=before_open), \
+                patch("btc_predictor.urllib.request.urlopen", side_effect=self.respond):
+            market = fetch_kalshi_market("KXBTC15M")
+        self.assertIsNone(market)
 
 
 if __name__ == "__main__":
