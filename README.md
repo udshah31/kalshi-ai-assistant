@@ -272,6 +272,26 @@ the separate comparison report hourly at minute 05 UTC. The timer persists acros
 reboots and catches up on a missed run. See [deployment operations](deploy/README.md#5-backups-and-operations)
 for manual refresh and schedule checks.
 
+A second standalone experiment asks whether the candle features add anything
+beyond the market's own issue-time price:
+
+```bash
+python3 validation.py compare-market \
+  --archive-file data/btc_15m_state_archive.sqlite3 \
+  --output-json data/btc_15m_market_comparison.json
+```
+
+It fits fresh `candles_only`, `market_only` (logit of the frozen YES midpoint),
+`candles_plus_market`, `strike_only` and `market_plus_strike` models with the
+same chronological folds and prior-known-label rules. The strike feature is
+log(issue price / strike) scaled by frozen 15m volatility and time left, where
+the issue price is the latest BTC-USD minute close completed and received by
+issue time, at most 120 seconds old. All models use identical forecasts that
+have frozen features, a fresh issue-time midpoint and a strike distance. `brier_minus_market_midpoint` compares each
+with the raw midpoint; negative is better. A midpoint is not an executable
+price, so beating it does not cover the spread or cost allowance. Not scheduled
+and not shown on the dashboard.
+
 The dashboard displays a **Context horizon comparison** card directly below the
 live prediction. It shows the current and challenger input horizons, held-out
 Brier score/log loss/accuracy, sample counts, report freshness and next-block
