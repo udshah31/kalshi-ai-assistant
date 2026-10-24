@@ -4,17 +4,21 @@ Storage section: a separate append-only SQLite file; rows are only ever inserted
 """
 from __future__ import annotations
 
+import argparse
 import json
+import signal
 import sqlite3
 import statistics
+import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
-from btc_predictor import timestamp_seconds
+from btc_predictor import DEFAULT_KALSHI_SERIES, INTERVAL_SECONDS, fetch_kalshi_market, timestamp_seconds
 
 # ---- storage -------------------------------------------------------------
 SCHEMA_VERSION = "1"
@@ -189,3 +193,98 @@ def sample_prices(offset_s: int, close_ts: int, fetch: Callable[[str], Any] | No
 def proxy_mid(rows: list[dict]) -> float | None:
     mids = [(r["bid"] + r["ask"]) / 2 for r in rows if r["error"] is None]
     return statistics.median(mids) if len(mids) >= 2 else None
+
+
+# ---- collector -----------------------------------------------------------
+PRICE_OFFSETS = range(-600, 1, 5)
+SNAPSHOT_OFFSETS = (-300, -120, -60, -30, -15)
+QUOTE_FIELDS = ("yes_bid", "yes_ask", "yes_ask_size", "no_bid", "no_ask", "no_ask_size")
+
+
+def next_close(now: float) -> int:
+    return int(now // INTERVAL_SECONDS + 1) * INTERVAL_SECONDS
+
+
+def snapshot_quote(offset_s: int, close_ts: int, fetch_market: Callable[[], dict | None]) -> dict:
+    row = {"close_ts": close_ts, "offset_s": offset_s, "ticker": None, **dict.fromkeys(QUOTE_FIELDS),
+           "observed_at": None, "error": None}
+    try:
+        market = fetch_market()
+        if market is None or timestamp_seconds(market.get("close_time")) != close_ts:
+            row["error"] = "wrong_market"
+        elif market.get("quote_source") != "kalshi_orderbook":
+            row["error"] = "no_orderbook"
+        else:
+            row.update({k: market.get(k) for k in ("ticker", *QUOTE_FIELDS, "observed_at")})
+    except Exception as exc:  # a failed fetch is a recorded gap, never a crash
+        row["error"] = f"fetch: {exc}"[:80]
+    return row
+
+
+def _gap_samples(offset_s: int, close_ts: int, error: str) -> list[dict]:
+    return [{"close_ts": close_ts, "offset_s": offset_s, "exchange": n, "bid": None, "ask": None,
+             "exchange_ts": None, "received_at": None, "error": error} for n in EXCHANGES]
+
+
+def _gap_snapshot(offset_s: int, close_ts: int, error: str) -> dict:
+    return {"close_ts": close_ts, "offset_s": offset_s, "ticker": None, **dict.fromkeys(QUOTE_FIELDS),
+            "observed_at": None, "error": error}
+
+
+def collect_window(close_ts: int, *, clock: Callable[[], float], sleep: Callable[[float], None],
+                   sample: Callable[[int, int], list[dict]], snapshot: Callable[[int, int], dict],
+                   stop: threading.Event) -> dict:
+    """Walk every offset on the wall clock; skipped offsets become gap rows so the window is complete."""
+    started = clock()
+    samples: list[dict] = []
+    snapshots: list[dict] = []
+    drift = 0.0
+    for offset in sorted(set(PRICE_OFFSETS) | set(SNAPSHOT_OFFSETS)):
+        target = close_ts + offset
+        error = "missed_start" if target < started else "stopped" if stop.is_set() else None
+        if error is None:
+            sleep(max(0, target - clock()))
+            if stop.is_set():
+                error = "stopped"
+        if error is None:
+            drift = max(drift, clock() - target)
+            if offset in PRICE_OFFSETS:
+                samples.extend(sample(offset, close_ts))
+            if offset in SNAPSHOT_OFFSETS:
+                snapshots.append(snapshot(offset, close_ts))
+        else:
+            if offset in PRICE_OFFSETS:
+                samples.extend(_gap_samples(offset, close_ts, error))
+            if offset in SNAPSHOT_OFFSETS:
+                snapshots.append(_gap_snapshot(offset, close_ts, error))
+    ticker = next((r["ticker"] for r in snapshots if r["error"] is None), None)
+    return {"close_ts": close_ts, "ticker": ticker, "started_at": started, "max_drift_seconds": drift,
+            "samples": samples, "snapshots": snapshots}
+
+
+def run_collector(state_file: str | Path, series: str, stop: threading.Event) -> None:
+    with closing(connect_store(late_window_path(state_file))) as connection:
+        while not stop.is_set():
+            window = collect_window(
+                next_close(time.time()), clock=time.time, sleep=stop.wait, stop=stop, sample=sample_prices,
+                snapshot=lambda o, c: snapshot_quote(o, c, lambda: fetch_kalshi_market(series)))
+            write_window(connection, window)  # a stopped window is still written, partial
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-file", default="data/btc_15m_state.json")
+    parser.add_argument("--kalshi-series", default=DEFAULT_KALSHI_SERIES)
+    args = parser.parse_args()
+    stop = threading.Event()
+    old = {sig: signal.signal(sig, lambda *_: stop.set()) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        run_collector(args.state_file, args.kalshi_series, stop)
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

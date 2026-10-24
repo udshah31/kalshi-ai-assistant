@@ -7,9 +7,9 @@ from pathlib import Path
 
 import late_window
 
-OFFSETS = range(-600, 1, 5)
+OFFSETS = late_window.PRICE_OFFSETS
 EXCHANGES = ("coinbase", "kraken", "bitstamp", "gemini")
-SNAPSHOT_OFFSETS = (-60, -45, -30, -15, 0)
+SNAPSHOT_OFFSETS = late_window.SNAPSHOT_OFFSETS
 
 
 def make_window(close_ts, failing=(), snapshot_errors=()):
@@ -130,3 +130,95 @@ class LateWindowPricesTests(unittest.TestCase):
             return {"bid": b, "ask": a, "error": error}
         self.assertEqual(late_window.proxy_mid([row(100, 102), row(101, 101), row(99, 103)]), 101.0)
         self.assertIsNone(late_window.proxy_mid([row(100, 102), row(None, None, "timeout")]))
+
+
+C = 1_800_000_900
+
+
+class FakeTime:
+    def __init__(self, now):
+        self.now = now
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class LateWindowCollectorTests(unittest.TestCase):
+    def run_window(self, start=C - 700, stop=None, on_sample=None, snapshot=None):
+        t = FakeTime(start)
+        calls = []
+
+        def sample(offset, close_ts):
+            calls.append(("sample", offset))
+            if on_sample:
+                on_sample(offset)
+            return [{"close_ts": close_ts, "offset_s": offset, "exchange": e, "bid": 1.0, "ask": 2.0,
+                     "exchange_ts": None, "received_at": t.now, "error": None} for e in late_window.EXCHANGES]
+
+        def default_snapshot(offset, close_ts):
+            calls.append(("snapshot", offset))
+            return late_window.snapshot_quote(offset, close_ts, lambda: {
+                "ticker": "KXBTC15M-T", "close_time": close_ts, "quote_source": "kalshi_orderbook",
+                "yes_bid": 0.5, "yes_ask": 0.52, "yes_ask_size": 10.0, "no_bid": 0.48, "no_ask": 0.5,
+                "no_ask_size": 8.0, "observed_at": t.now})
+
+        window = late_window.collect_window(
+            C, clock=t.clock, sleep=t.sleep, sample=sample, snapshot=snapshot or default_snapshot,
+            stop=stop or threading.Event())
+        return window, calls
+
+    def test_offsets_and_next_close(self):
+        self.assertEqual(late_window.next_close(1_800_000_000), 1_800_000_900)
+        self.assertEqual(late_window.next_close(1_800_000_900), 1_800_001_800)
+        self.assertEqual(len(late_window.PRICE_OFFSETS), 121)
+
+    def test_collect_window_samples_every_offset_in_order(self):
+        window, calls = self.run_window()
+        self.assertEqual(sum(c[0] == "sample" for c in calls), 121)
+        self.assertEqual(sum(c[0] == "snapshot" for c in calls), 5)
+        self.assertLess(calls.index(("sample", -300)), calls.index(("snapshot", -300)))
+        self.assertEqual(window["ticker"], "KXBTC15M-T")
+        self.assertEqual(window["started_at"], C - 700)
+        self.assertEqual(window["max_drift_seconds"], 0)
+        self.assertTrue(all(r["error"] is None for r in window["samples"] + window["snapshots"]))
+
+    def test_restart_midwindow_writes_partial_once(self):
+        window, calls = self.run_window(start=C - 100)
+        missed = [r for r in window["samples"] if r["error"] == "missed_start"]
+        self.assertEqual(len(missed), 4 * len(range(-600, -100, 5)))
+        self.assertTrue(all(r["bid"] is None and r["received_at"] is None for r in missed))
+        self.assertEqual({r["offset_s"] for r in window["snapshots"] if r["error"] == "missed_start"}, {-300, -120})
+        self.assertEqual(len(window["samples"]), 121 * 4)
+        self.assertEqual(window["ticker"], "KXBTC15M-T")
+        with tempfile.TemporaryDirectory() as d, closing(late_window.connect_store(Path(d) / "x.sqlite3")) as db:
+            self.assertTrue(late_window.write_window(db, window))
+            self.assertFalse(late_window.write_window(db, window))
+
+    def test_snapshot_for_wrong_close_is_a_gap(self):
+        row = late_window.snapshot_quote(-60, C, lambda: {
+            "ticker": "T", "close_time": C + 900, "quote_source": "kalshi_orderbook", "yes_bid": 0.5})
+        self.assertEqual(row["error"], "wrong_market")
+        self.assertIsNone(row["ticker"])
+        self.assertIsNone(row["yes_bid"])
+        self.assertEqual(late_window.snapshot_quote(-60, C, lambda: None)["error"], "wrong_market")
+        self.assertEqual(late_window.snapshot_quote(-60, C, lambda: {
+            "close_time": C, "quote_source": "market_summary_only"})["error"], "no_orderbook")
+
+    def test_snapshot_fetch_failure_never_raises(self):
+        def boom():
+            raise RuntimeError("down")
+        self.assertEqual(late_window.snapshot_quote(-60, C, boom)["error"], "fetch: down")
+
+    def test_stop_midwindow_keeps_collected_samples(self):
+        stop = threading.Event()
+        window, calls = self.run_window(stop=stop, on_sample=lambda o: stop.set() if o == -300 else None)
+        for r in window["samples"]:
+            self.assertEqual(r["error"], None if r["offset_s"] <= -300 else "stopped")
+        self.assertEqual([r["error"] for r in window["snapshots"]],
+                         [None, "stopped", "stopped", "stopped", "stopped"])
+        self.assertEqual(len(window["samples"]), 121 * 4)
+        self.assertTrue(all(r["observed_at"] is None and r["ticker"] is None
+                            for r in window["snapshots"] if r["error"] == "stopped"))
