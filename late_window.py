@@ -4,8 +4,17 @@ Storage section: a separate append-only SQLite file; rows are only ever inserted
 """
 from __future__ import annotations
 
+import json
 import sqlite3
+import statistics
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, Callable
+
+from btc_predictor import timestamp_seconds
 
 # ---- storage -------------------------------------------------------------
 SCHEMA_VERSION = "1"
@@ -95,3 +104,80 @@ def record_official(connection: sqlite3.Connection, row: dict) -> bool:
     except BaseException:
         connection.execute("ROLLBACK")
         raise
+
+
+# ---- prices --------------------------------------------------------------
+def _quote(bid: Any, ask: Any, exchange_ts: float | None) -> dict:
+    bid, ask = float(bid), float(ask)
+    if not 0 < bid <= ask:
+        raise ValueError(f"bad quote bid={bid} ask={ask}")
+    return {"bid": bid, "ask": ask, "exchange_ts": exchange_ts}
+
+
+def parse_coinbase(payload: Any) -> dict:
+    ts = timestamp_seconds(payload["time"])
+    if ts is None:
+        raise ValueError("bad time")
+    return _quote(payload["bid"], payload["ask"], ts)
+
+
+def parse_kraken(payload: Any) -> dict:
+    (entry,) = payload["result"].values()  # result key varies (XXBTZUSD); no exchange time
+    return _quote(entry["b"][0], entry["a"][0], None)
+
+
+def parse_bitstamp(payload: Any) -> dict:
+    return _quote(payload["bid"], payload["ask"], float(payload["timestamp"]))
+
+
+def parse_gemini(payload: Any) -> dict:
+    return _quote(payload["bid"], payload["ask"], float(payload["volume"]["timestamp"]) / 1000)
+
+
+EXCHANGES: dict[str, tuple[str, Callable[[Any], dict]]] = {
+    "coinbase": ("https://api.exchange.coinbase.com/products/BTC-USD/ticker", parse_coinbase),
+    "kraken": ("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", parse_kraken),
+    "bitstamp": ("https://www.bitstamp.net/api/v2/ticker/btcusd/", parse_bitstamp),
+    "gemini": ("https://api.gemini.com/v1/pubticker/btcusd", parse_gemini),
+}
+
+
+def fetch_json(url: str, timeout: float = 3.0) -> Any:
+    request = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": "btc-15m-predictor/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _error_text(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+        return "timeout"
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, (KeyError, IndexError, TypeError, ValueError)):
+        return f"parse: {exc}"
+    return f"{type(exc).__name__}: {exc}"[:80]
+
+
+def _sample_one(name: str, offset_s: int, close_ts: int, fetch: Callable[[str], Any]) -> dict:
+    url, parser = EXCHANGES[name]
+    row = {"close_ts": close_ts, "offset_s": offset_s, "exchange": name,
+           "bid": None, "ask": None, "exchange_ts": None, "received_at": None, "error": None}
+    try:
+        row.update(parser(fetch(url)))
+    except Exception as exc:  # any failure is a recorded gap, never a crash
+        row["error"] = _error_text(exc)
+    row["received_at"] = time.time()
+    return row
+
+
+def sample_prices(offset_s: int, close_ts: int, fetch: Callable[[str], Any] | None = None,
+                  timeout: float = 3.0) -> list[dict]:
+    fetch = fetch or (lambda url: fetch_json(url, timeout))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return list(pool.map(lambda n: _sample_one(n, offset_s, close_ts, fetch), EXCHANGES))
+
+
+def proxy_mid(rows: list[dict]) -> float | None:
+    mids = [(r["bid"] + r["ask"]) / 2 for r in rows if r["error"] is None]
+    return statistics.median(mids) if len(mids) >= 2 else None

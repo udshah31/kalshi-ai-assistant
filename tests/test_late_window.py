@@ -56,3 +56,55 @@ class LateWindowStoreTests(unittest.TestCase):
             self.assertTrue(late_window.record_official(db, row))
             self.assertFalse(late_window.record_official(db, {**row, "expiration_value": 1.0}))
             self.assertEqual(db.execute("SELECT expiration_value FROM official_values").fetchone()[0], 82813.54)
+
+
+class LateWindowPricesTests(unittest.TestCase):
+    def test_parsers_recorded_shapes(self):
+        cb = late_window.parse_coinbase({"bid": "100.5", "ask": "101", "time": "2026-10-24T12:00:00.500000Z"})
+        self.assertEqual((cb["bid"], cb["ask"], cb["exchange_ts"]), (100.5, 101.0, 1792843200.5))
+        kr = late_window.parse_kraken({"error": [], "result": {"XXBTZUSD": {"b": ["100.0", "1", "1.0"], "a": ["101.0", "1", "1.0"]}}})
+        self.assertEqual((kr["bid"], kr["ask"], kr["exchange_ts"]), (100.0, 101.0, None))
+        bs = late_window.parse_bitstamp({"bid": "100", "ask": "101", "timestamp": "1792858000"})
+        self.assertEqual(bs["exchange_ts"], 1792858000.0)
+        gm = late_window.parse_gemini({"bid": "100", "ask": "101", "volume": {"timestamp": 1792858000123}})
+        self.assertEqual(gm["exchange_ts"], 1792858000.123)
+
+    def test_parser_rejects_crossed_or_nonpositive(self):
+        with self.assertRaises(ValueError):
+            late_window.parse_bitstamp({"bid": "102", "ask": "101", "timestamp": "1"})
+        with self.assertRaises(ValueError):
+            late_window.parse_bitstamp({"bid": "0", "ask": "101", "timestamp": "1"})
+
+    def test_sample_survives_one_failing_exchange(self):
+        payloads = {
+            late_window.EXCHANGES["coinbase"][0]: {"bid": "100", "ask": "101", "time": "2026-10-24T12:00:00Z"},
+            late_window.EXCHANGES["bitstamp"][0]: {"bid": "100", "ask": "101", "timestamp": "1"},
+            late_window.EXCHANGES["gemini"][0]: {"bid": "100", "ask": "101", "volume": {"timestamp": 1000}},
+        }
+
+        def fetch(url):
+            if url not in payloads:
+                raise TimeoutError("slow")
+            return payloads[url]
+
+        rows = late_window.sample_prices(-30, 5000, fetch)
+        self.assertEqual({r["exchange"] for r in rows}, set(EXCHANGES))
+        self.assertEqual({r["offset_s"] for r in rows}, {-30})
+        for r in rows:
+            self.assertEqual(set(r), set(late_window.SAMPLE_COLUMNS))
+            self.assertEqual(r["close_ts"], 5000)
+        bad = [r for r in rows if r["error"]]
+        self.assertEqual([r["exchange"] for r in bad], ["kraken"])
+        self.assertEqual(bad[0]["error"], "timeout")
+        self.assertIsNone(bad[0]["bid"])
+        self.assertEqual(sum(r["bid"] == 100.0 for r in rows), 3)
+
+    def test_parse_failure_is_recorded(self):
+        rows = late_window.sample_prices(0, 1, lambda url: {"nonsense": 1})
+        self.assertTrue(all(r["error"].startswith("parse: ") for r in rows))
+
+    def test_proxy_mid(self):
+        def row(b, a, error=None):
+            return {"bid": b, "ask": a, "error": error}
+        self.assertEqual(late_window.proxy_mid([row(100, 102), row(101, 101), row(99, 103)]), 101.0)
+        self.assertIsNone(late_window.proxy_mid([row(100, 102), row(None, None, "timeout")]))
