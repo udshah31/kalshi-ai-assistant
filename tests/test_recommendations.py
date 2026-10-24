@@ -323,6 +323,26 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(validation["ready"])
         self.assertTrue(any("baseline" in b for b in validation["blockers"]))
 
+    def test_statistical_gate_requires_beating_issue_time_market_midpoint(self):
+        _, state, _ = self.strong_candidate()
+        self.assertTrue(official_validation(state)["ready"])
+        for trade in state["paper_trades"]:
+            trade["market_snapshot"].update({"yes_bid": .89, "yes_ask": .91})  # market more confident and right
+        validation = official_validation(state)
+        self.assertLess(validation["brier"], .25)
+        self.assertGreater(validation["market_model_brier"], validation["market_brier"])
+        self.assertFalse(validation["ready"])
+        self.assertTrue(any("market midpoint" in b for b in validation["blockers"]))
+        for index, trade in enumerate(state["paper_trades"]):
+            trade["market_snapshot"].update({"yes_bid": .49, "yes_ask": .51})
+            if index >= 19:  # stale quote or another market's quote is not issue-time evidence
+                trade["market_snapshot"].update({"observed_at": trade["forecast_issued_at"] - 61} if index % 2
+                                                else {"ticker": "other"})
+        validation = official_validation(state)
+        self.assertEqual(validation["market_samples"], 19)
+        self.assertFalse(validation["ready"])
+        self.assertIn("market midpoint comparison 19/20 rolling samples with issue-time quotes", validation["blockers"])
+
     def test_threshold_boundaries_do_not_lower_safety_limits(self):
         m = market(); m.update({"yes_bid": .53, "yes_ask": .54, "yes_ask_size": 25.})
         signal = evaluate_trade_signal(.65, m, FEATURES, bar_timestamp=BAR, now=NOW)

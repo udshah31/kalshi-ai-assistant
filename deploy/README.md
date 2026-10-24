@@ -205,7 +205,7 @@ Copy snapshots off the VM periodically. From the Mac project directory:
 (
   umask 077
   ssh -i "$SSH_KEY" "$VM_USER@$VM_IP" \
-    'sudo python3 /opt/kalshi/backup_state.py export --backup-dir /var/lib/kalshi/backups' \
+    'sudo /opt/kalshi/deploy/container-python backup /opt/kalshi/backup_state.py export --backup-dir /var/lib/kalshi/backups' \
     > dist/kalshi-vm-backups.tgz.partial && \
   mv dist/kalshi-vm-backups.tgz.partial dist/kalshi-vm-backups.tgz
 )

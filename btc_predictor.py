@@ -981,6 +981,19 @@ def paper_trade_summary(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def issue_time_midpoint(trade: dict[str, Any]) -> float | None:
+    """Frozen YES midpoint for this exact ticker, quoted at most 60s before issue."""
+    market = trade.get("market_snapshot") or {}
+    bid, ask = optional_number(market.get("yes_bid")), optional_number(market.get("yes_ask"))
+    observed = timestamp_seconds(market.get("observed_at"))
+    issued = timestamp_seconds(trade.get("forecast_issued_at"))
+    if (market.get("ticker") != trade.get("market_ticker") or bid is None or ask is None
+            or not 0 <= bid <= ask <= 1 or observed is None or issued is None
+            or not 0 <= issued - observed <= MAX_QUOTE_AGE_SECONDS):
+        return None
+    return (bid + ask) / 2
+
+
 def official_validation(state: dict[str, Any]) -> dict[str, Any]:
     """Do not validate a Kalshi contract strategy with Coinbase proxy outcomes."""
     seen = set()
@@ -1004,6 +1017,16 @@ def official_validation(state: dict[str, Any]) -> dict[str, Any]:
         blockers.append(f"official rolling accuracy {accuracy:.1%} is below 50%")
     if len(recent) >= 20 and brier is not None and brier >= .25:
         blockers.append(f"official Brier {brier:.3f} does not beat the constant 50% baseline (0.250)")
+    # The market midpoint is a far stronger baseline than 50%; compare on identical rows.
+    paired = [(float(t["probability_up"]), midpoint, int(t["outcome"] == "UP"))
+              for t in recent if (midpoint := issue_time_midpoint(t)) is not None]
+    model_market_brier = sum((p - y) ** 2 for p, _, y in paired) / len(paired) if paired else None
+    market_brier = sum((m - y) ** 2 for _, m, y in paired) / len(paired) if paired else None
+    if len(paired) < 20:
+        blockers.append(f"market midpoint comparison {len(paired)}/20 rolling samples with issue-time quotes")
+    elif model_market_brier >= market_brier:
+        blockers.append(f"official Brier {model_market_brier:.3f} does not beat the market midpoint "
+                        f"({market_brier:.3f}) on {len(paired)} quoted samples")
     calibration = []
     for lower in (.5, .6, .7, .8, .9):
         group = [t for t in recent if lower <= max(float(t["probability_up"]), 1 - float(t["probability_up"])) < lower + .1 + (1e-9 if lower == .9 else 0)]
@@ -1013,7 +1036,8 @@ def official_validation(state: dict[str, Any]) -> dict[str, Any]:
                                 "observed_accuracy": sum(bool(t.get("correct")) for t in group)/len(group)})
     return {"samples": len(trades), "minimum_samples": MIN_LIVE_SAMPLES,
             "rolling_samples": len(recent), "accuracy": accuracy, "brier": brier,
-            "baseline_brier": .25, "ready": not blockers, "blockers": blockers,
+            "baseline_brier": .25, "market_samples": len(paired), "market_model_brier": model_market_brier,
+            "market_brier": market_brier, "ready": not blockers, "blockers": blockers,
             "calibration": calibration, "probability_status": "uncalibrated model estimate",
             "note": "Preliminary forward paper evidence only; no walk-forward profitability claim."}
 
