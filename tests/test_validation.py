@@ -803,6 +803,26 @@ class ValidationTests(unittest.TestCase):
         self.assertAlmostEqual(validation.strike_distance(record, 101.0), math.log(1.01) / .002)
         self.assertIsNone(validation.strike_distance({**record, "snapshot": {}}, 101.0))
 
+    def test_market_fit_converges_where_few_sgd_epochs_underfit(self):
+        # 100 rows (the default train size) from a perfectly calibrated midpoint near
+        # 50%, like real Kalshi quotes: a fraction p of the 25 rows at logit(p) are YES,
+        # so the unpenalized fit is weight 1, bias 0.
+        rows, labels = [], []
+        for p in (.4, .44, .56, .6):
+            yes = round(25 * p)
+            rows += [[validation._logit(p)]] * 25
+            labels += [1] * yes + [0] * (25 - yes)
+        model = validation._fit_logistic(rows, labels)
+        self.assertAlmostEqual(model.weights[0], 1.0, delta=.05)
+        self.assertAlmostEqual(model.bias, 0.0, delta=.05)
+        sgd = validation.OnlineLogisticRegression(n_features=1)
+        for _ in range(5):  # the old compare-market fit
+            for row, label in zip(rows, labels):
+                sgd.update(row, label)
+        self.assertLess(sgd.weights[0], .6)  # the under-fit this replaces
+        self.assertAlmostEqual(validation._normal_cdf(0), .5)
+        self.assertAlmostEqual(validation._normal_cdf(1.96), .975, places=3)
+
     def test_market_comparison_scores_identical_quote_rows_and_is_read_only(self):
         self.context_series(15)
         with closing(sqlite3.connect(self.archive)) as db, db:
@@ -815,7 +835,7 @@ class ValidationTests(unittest.TestCase):
             self.update("forecasts", f"f{index}", market_snapshot_json=json.dumps(market(index, target_price=100.0)))
         self.update("forecasts", "f10", market_snapshot_json=json.dumps(market(10, target_price=100.0, observed_at=market(10)["observed_at"] + 1)))
         before = self.archive.read_bytes()
-        report = validation.compare_market_models(self.archive, train_size=8, test_size=5, epochs=2)
+        report = validation.compare_market_models(self.archive, train_size=8, test_size=5)
         self.assertEqual(report["coverage"]["features_midpoint_and_strike_distance"], 13)
         self.assertEqual(report["coverage"]["missing_fresh_midpoint"], 1)
         self.assertEqual(report["coverage"]["missing_fresh_issue_price_or_strike"], 1)
@@ -827,12 +847,15 @@ class ValidationTests(unittest.TestCase):
         counts = {metrics["count"] for metrics in report["models"].values()}
         self.assertEqual(counts, {5})
         self.assertEqual(len(report["folds"][0]["weights"]["candles_plus_market"]["weights"]), len(FEATURE_NAMES) + 1)
+        prediction = report["folds"][0]["predictions"][0]
+        self.assertIn("strike_formula", report["brier_minus_market_midpoint"])
+        self.assertTrue(0 < prediction["strike_formula"] < 1)
         self.assertAlmostEqual(report["brier_minus_market_midpoint"]["market_only"],
                                report["models"]["market_only"]["brier_score"] - report["models"]["market_midpoint"]["brier_score"])
         self.assertEqual(self.archive.read_bytes(), before)
         result = subprocess.run([sys.executable, str(Path(validation.__file__)), "compare-market",
-                                 "--archive-file", str(self.archive), "--train-size", "8", "--test-size", "5",
-                                 "--epochs", "2"], text=True, capture_output=True, check=False)
+                                 "--archive-file", str(self.archive), "--train-size", "8", "--test-size", "5"],
+                                text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["models"].keys(), report["models"].keys())
 
