@@ -222,3 +222,30 @@ class LateWindowCollectorTests(unittest.TestCase):
         self.assertEqual(len(window["samples"]), 121 * 4)
         self.assertTrue(all(r["observed_at"] is None and r["ticker"] is None
                             for r in window["snapshots"] if r["error"] == "stopped"))
+
+    def test_slow_snapshot_turns_late_offsets_into_gaps(self):
+        t = FakeTime(C - 700)
+        sampled = []
+
+        def sample(offset, close_ts):
+            sampled.append(offset)
+            return late_window._gap_samples(offset, close_ts, None)
+
+        def snapshot(offset, close_ts):
+            if offset == -15:
+                t.now += 20
+            return late_window._gap_snapshot(offset, close_ts, None)
+
+        window = late_window.collect_window(C, clock=t.clock, sleep=t.sleep, sample=sample,
+                                            snapshot=snapshot, stop=threading.Event())
+        for o in (-10, -5, 0):
+            self.assertNotIn(o, sampled)
+            self.assertEqual({r["error"] for r in window["samples"] if r["offset_s"] == o}, {"late"})
+        self.assertIn(-15, sampled)
+
+    def test_all_gap_window_has_no_evidence(self):
+        gaps = late_window.collect_window(C, clock=FakeTime(C + 5).clock, sleep=lambda s: None,
+                                          sample=None, snapshot=None, stop=threading.Event())
+        self.assertFalse(late_window.has_evidence(gaps))
+        gaps["samples"][0] = {**gaps["samples"][0], "error": None}
+        self.assertTrue(late_window.has_evidence(gaps))

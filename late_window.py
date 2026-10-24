@@ -198,6 +198,7 @@ def proxy_mid(rows: list[dict]) -> float | None:
 # ---- collector -----------------------------------------------------------
 PRICE_OFFSETS = range(-600, 1, 5)
 SNAPSHOT_OFFSETS = (-300, -120, -60, -30, -15)
+LATE_TOLERANCE_SECONDS = 2.0
 QUOTE_FIELDS = ("yes_bid", "yes_ask", "yes_ask_size", "no_bid", "no_ask", "no_ask_size")
 
 
@@ -244,22 +245,25 @@ def collect_window(close_ts: int, *, clock: Callable[[], float], sleep: Callable
         error = "missed_start" if target < started else "stopped" if stop.is_set() else None
         if error is None:
             sleep(max(0, target - clock()))
-            if stop.is_set():
-                error = "stopped"
-        if error is None:
-            drift = max(drift, clock() - target)
-            if offset in PRICE_OFFSETS:
-                samples.extend(sample(offset, close_ts))
-            if offset in SNAPSHOT_OFFSETS:
-                snapshots.append(snapshot(offset, close_ts))
-        else:
-            if offset in PRICE_OFFSETS:
-                samples.extend(_gap_samples(offset, close_ts, error))
-            if offset in SNAPSHOT_OFFSETS:
-                snapshots.append(_gap_snapshot(offset, close_ts, error))
+            error = "stopped" if stop.is_set() else None
+        for kind in ("price", "snapshot"):
+            if kind == "price" and offset not in PRICE_OFFSETS or kind == "snapshot" and offset not in SNAPSHOT_OFFSETS:
+                continue
+            late = clock() - target
+            row_error = error or ("late" if late > LATE_TOLERANCE_SECONDS else None)
+            if row_error is None:
+                drift = max(drift, late)
+            if kind == "price":
+                samples.extend(_gap_samples(offset, close_ts, row_error) if row_error else sample(offset, close_ts))
+            else:
+                snapshots.append(_gap_snapshot(offset, close_ts, row_error) if row_error else snapshot(offset, close_ts))
     ticker = next((r["ticker"] for r in snapshots if r["error"] is None), None)
     return {"close_ts": close_ts, "ticker": ticker, "started_at": started, "max_drift_seconds": drift,
             "samples": samples, "snapshots": snapshots}
+
+
+def has_evidence(window: dict) -> bool:
+    return any(r["error"] is None for r in window["samples"] + window["snapshots"])
 
 
 def run_collector(state_file: str | Path, series: str, stop: threading.Event) -> None:
@@ -267,8 +271,10 @@ def run_collector(state_file: str | Path, series: str, stop: threading.Event) ->
         while not stop.is_set():
             window = collect_window(
                 next_close(time.time()), clock=time.time, sleep=stop.wait, stop=stop, sample=sample_prices,
-                snapshot=lambda o, c: snapshot_quote(o, c, lambda: fetch_kalshi_market(series)))
-            write_window(connection, window)  # a stopped window is still written, partial
+                snapshot=lambda o, c: snapshot_quote(o, c, lambda: fetch_kalshi_market(series, timeout=3)))
+            # first write wins, so never let an evidence-free window block a later full one
+            if has_evidence(window):
+                write_window(connection, window)
 
 
 def main() -> int:
