@@ -12,7 +12,9 @@ BACKUP_ROOT="$STATE_ROOT/backups"
 ROLLBACK_ROOT="$STATE_ROOT/deploy-rollbacks"
 RUNTIME_ENV="$CONFIG_ROOT/container-runtime.env"
 
-APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service)
+APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service kalshi-late-window.service)
+# Units a release may introduce: absent from the host before their first deploy.
+NEW_UNITS=(kalshi-late-window.service)
 SCHEDULED_UNITS=(kalshi-backup.timer kalshi-backup.service kalshi-context-comparison.timer kalshi-context-comparison.service)
 ALL_UNITS=("${APP_SERVICES[@]}" "${SCHEDULED_UNITS[@]}")
 
@@ -49,7 +51,7 @@ for path in "$ROOT" "$STATE_FILE" "$ARCHIVE_FILE" "$CONFIG_ROOT/kalshi.env" "$RU
     [[ -e "$path" ]] || fail "required deployment path is missing: $path"
 done
 for unit in "${ALL_UNITS[@]}"; do
-    [[ -f "$SYSTEMD_ROOT/$unit" ]] || fail "required systemd unit is missing: $unit"
+    [[ " ${NEW_UNITS[*]} " == *" $unit "* || -f "$SYSTEMD_ROOT/$unit" ]] || fail "required systemd unit is missing: $unit"
 done
 id kalshi >/dev/null 2>&1 || fail "kalshi service account is missing"
 
@@ -65,10 +67,11 @@ validate_bundle() {
     done < <(tar -tzf "$BUNDLE")
     local required
     for required in \
-        btc_predictor.py dashboard.py live_runner.py forecast_archive.py validation.py backup_state.py \
+        btc_predictor.py dashboard.py live_runner.py forecast_archive.py validation.py backup_state.py late_window.py \
         deploy/container-python deploy/oracle-container-deploy.sh \
         deploy/container-systemd/kalshi-dashboard.service \
         deploy/container-systemd/kalshi-runner.service \
+        deploy/container-systemd/kalshi-late-window.service \
         deploy/container-systemd/kalshi-backup.service \
         deploy/container-systemd/kalshi-context-comparison.service \
         deploy/container-systemd/kalshi-backup.timer \
@@ -101,12 +104,27 @@ cleanup() {
     rm -rf -- "$STAGE"
 }
 
+# Only units installed on the host: a unit new in this release is not there
+# before the first deploy installs it, nor after a rollback removes it.
+installed_units() {
+    local unit
+    for unit in "$@"; do
+        [[ -f "$SYSTEMD_ROOT/$unit" ]] && printf '%s\n' "$unit"
+    done
+    return 0
+}
+
 start_all() {
-    systemctl start "${APP_SERVICES[@]}" kalshi-backup.timer kalshi-context-comparison.timer
+    local units=()
+    while IFS= read -r unit; do units+=("$unit"); done \
+        < <(installed_units "${APP_SERVICES[@]}" kalshi-backup.timer kalshi-context-comparison.timer)
+    systemctl start "${units[@]}"
 }
 
 stop_all() {
-    systemctl stop "${ALL_UNITS[@]}"
+    local units=()
+    while IFS= read -r unit; do units+=("$unit"); done < <(installed_units "${ALL_UNITS[@]}")
+    systemctl stop "${units[@]}"
 }
 
 container_python() {
@@ -153,7 +171,13 @@ rollback_on_error() {
             mv -- "$ROLLBACK_CODE" "$ROOT" || rollback_status=1
         fi
         for unit in "${ALL_UNITS[@]}"; do
-            install -o root -g root -m 0644 "$ROLLBACK_UNITS/$unit" "$SYSTEMD_ROOT/$unit" || rollback_status=1
+            if [[ -f "$ROLLBACK_UNITS/$unit" ]]; then
+                install -o root -g root -m 0644 "$ROLLBACK_UNITS/$unit" "$SYSTEMD_ROOT/$unit" || rollback_status=1
+            else
+                # Unit did not exist in the previous release: do not leave it behind.
+                systemctl disable "$unit" >/dev/null 2>&1
+                rm -f -- "$SYSTEMD_ROOT/$unit" || rollback_status=1
+            fi
         done
         install -o root -g root -m 0600 "$ROLLBACK_RUNTIME" "$RUNTIME_ENV" || rollback_status=1
         systemctl daemon-reload || rollback_status=1
@@ -188,7 +212,9 @@ STOPPED=1
 stop_all
 cp -a "$ROOT" "$ROLLBACK_CODE"
 for unit in "${ALL_UNITS[@]}"; do
-    install -o root -g root -m 0644 "$SYSTEMD_ROOT/$unit" "$ROLLBACK_UNITS/$unit"
+    if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then
+        install -o root -g root -m 0644 "$SYSTEMD_ROOT/$unit" "$ROLLBACK_UNITS/$unit"
+    fi
 done
 install -o root -g root -m 0600 "$RUNTIME_ENV" "$ROLLBACK_RUNTIME"
 rm -rf -- "$ROOT"

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 job=${1:?usage: container-python JOB COMMAND [ARGS...]}
 shift
 case "$job" in
-    backup|comparison|dashboard|inspect|runner) ;;
+    backup|comparison|dashboard|inspect|late|runner) ;;
     *) printf 'container-python: unsupported job: %s\n' "$job" >&2; exit 2 ;;
 esac
 

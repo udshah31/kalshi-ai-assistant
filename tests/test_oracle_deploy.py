@@ -66,6 +66,7 @@ class OracleDeployScriptTests(unittest.TestCase):
         for name in (
             "kalshi-dashboard.service", "kalshi-runner.service",
             "kalshi-backup.service", "kalshi-context-comparison.service",
+            "kalshi-late-window.service",
         ):
             unit = (ROOT / "deploy/container-systemd" / name).read_text(encoding="utf-8")
             self.assertIn("/opt/kalshi/deploy/container-python", unit)
@@ -74,6 +75,34 @@ class OracleDeployScriptTests(unittest.TestCase):
     def test_container_deploy_opens_staged_code_for_the_service_uid(self):
         script = (ROOT / "deploy/oracle-container-deploy.sh").read_text(encoding="utf-8")
         self.assertIn('chmod 0755 "$STAGE"', script)
+
+    def test_late_window_service_is_independent_and_bundled(self):
+        unit = (ROOT / "deploy/container-systemd/kalshi-late-window.service").read_text(encoding="utf-8")
+        self.assertIn("container-python late /opt/kalshi/late_window.py", unit)
+        self.assertIn("--kalshi-series KXBTC15M", unit)
+        self.assertIn("ExecStop=/usr/bin/docker stop --time 30 kalshi-late", unit)
+        self.assertNotIn("kalshi-runner.service", unit)
+        self.assertNotIn("kalshi-dashboard.service", unit)
+        self.assertIn("late)", (ROOT / "deploy/container-python").read_text(encoding="utf-8").replace("|", ")\n"))
+        script = CONTAINER_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service kalshi-late-window.service)", script)
+        self.assertIn("late_window.py", script)
+        self.assertIn("deploy/container-systemd/kalshi-late-window.service", script)
+        self.assertIn("late_window.py", (ROOT / "deploy/package.sh").read_text(encoding="utf-8"))
+        # health stays runner+dashboard only
+        ready = script.split("wait_ready() {")[1].split("\n}\n")[0]
+        self.assertNotIn("late-window", ready)
+
+    def test_container_rollback_removes_units_absent_from_the_previous_release(self):
+        script = CONTAINER_SCRIPT.read_text(encoding="utf-8")
+        # first deploy: unit is not preinstalled, not snapshotted, not stopped/started when absent
+        self.assertIn("NEW_UNITS=(kalshi-late-window.service)", script)
+        self.assertIn('if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then\n        install', script)
+        self.assertIn('if [[ -f "$ROLLBACK_UNITS/$unit" ]]; then', script)
+        self.assertIn('systemctl disable "$unit"', script)
+        self.assertIn('rm -f -- "$SYSTEMD_ROOT/$unit"', script)
+        self.assertIn("installed_units", script.split("stop_all() {")[1].split("}")[0])
+        self.assertIn("installed_units", script.split("start_all() {")[1].split("}")[0])
 
 
 class OracleDeployTransactionTests(unittest.TestCase):
