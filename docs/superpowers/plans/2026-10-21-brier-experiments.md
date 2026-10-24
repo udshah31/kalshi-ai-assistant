@@ -38,12 +38,12 @@ comparison panels; all fitted adjustments use past known outcomes only.
 **Interfaces:** `compare_archive(path: Path) -> dict`, `_panel(records: list[dict], *, quotes: bool) -> dict`.
 - [x] Add failing tests for chronology, delayed labels, same-panel populations, unscored rows,
   bounded analytic weights, empty inputs, UTC daily grouping and deterministic uncertainty.
-- [x] Run `python3 -m unittest discover -s tests -p test_brier_experiment.py -v`; observe missing implementation.
+- [ ] Run `python3 -m unittest discover -s tests -p test_brier_experiment.py -v`; observe missing implementation. (Not recorded.)
 - [x] Implement with existing `_read_archive`, `_forecast`, `_official_result`, `_market_midpoint`,
   `_fit_platt`, `_logit`, `_metrics`; no caller changes in live modules.
 - [x] Add an archive integration test for deduplication, invalid outcome exclusion and read-only behavior.
 - [x] Run targeted tests then full `python3 -m unittest discover -s tests`.
-- [x] Run CLI on verified snapshot; preserve JSON and input SHA256 under ignored data/.
+- [x] Run CLI on verified snapshot; input SHA256 recorded in results. JSON kept in a local scratch directory, not data/.
 
 ### Task 3: Interpret, review and hand off
 **Files:** `docs/research/2026-10-21-brier-results.md`, plan and ledger.
@@ -51,7 +51,7 @@ comparison panels; all fitted adjustments use past known outcomes only.
 - [x] Report fair same-population metrics, uncertainty, daily consistency and limitations.
 - [x] Specify a frozen prospective candidate and confirmation criteria only if supported;
   otherwise explain the lack of evidence and the next bounded experiment.
-- [x] Fresh reviewer checks code, tests and conclusions; fix important findings, rerun affected checks.
+- [ ] Fresh reviewer checks code, tests and conclusions; fix important findings, rerun affected checks. (Left to PR review.)
 - [x] Commit only this work locally; record completed steps and exact test count.
 
 ## Execution decisions
