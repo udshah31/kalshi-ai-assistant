@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -98,6 +100,26 @@ class LateWindowPricesTests(unittest.TestCase):
         self.assertEqual(bad[0]["error"], "timeout")
         self.assertIsNone(bad[0]["bid"])
         self.assertEqual(sum(r["bid"] == 100.0 for r in rows), 3)
+
+    def test_sample_returns_by_deadline_when_one_exchange_hangs(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        ok = {"bid": "100", "ask": "101", "time": "2026-10-24T12:00:00Z",
+              "timestamp": "1", "volume": {"timestamp": 1000}}
+        kraken_url = late_window.EXCHANGES["kraken"][0]
+
+        def fetch(url):
+            if url == kraken_url:
+                release.wait(10)
+            return ok
+
+        started = time.monotonic()
+        rows = late_window.sample_prices(-5, 5000, fetch, timeout=0.2)
+        self.assertLess(time.monotonic() - started, 1.0)
+        by = {r["exchange"]: r for r in rows}
+        self.assertEqual(by["kraken"]["error"], "timeout")
+        self.assertIsNone(by["kraken"]["bid"])
+        self.assertTrue(all(by[e]["bid"] == 100.0 for e in ("coinbase", "bitstamp", "gemini")))
 
     def test_parse_failure_is_recorded(self):
         rows = late_window.sample_prices(0, 1, lambda url: {"nonsense": 1})

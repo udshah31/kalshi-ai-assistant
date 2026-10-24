@@ -10,7 +10,7 @@ import statistics
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
@@ -173,9 +173,17 @@ def _sample_one(name: str, offset_s: int, close_ts: int, fetch: Callable[[str], 
 
 def sample_prices(offset_s: int, close_ts: int, fetch: Callable[[str], Any] | None = None,
                   timeout: float = 3.0) -> list[dict]:
+    """Return within ~timeout wall seconds; exchanges still running become error="timeout" rows."""
     fetch = fetch or (lambda url: fetch_json(url, timeout))
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        return list(pool.map(lambda n: _sample_one(n, offset_s, close_ts, fetch), EXCHANGES))
+    pool = ThreadPoolExecutor(max_workers=len(EXCHANGES))
+    futures = {n: pool.submit(_sample_one, n, offset_s, close_ts, fetch) for n in EXCHANGES}
+    wait(futures.values(), timeout=timeout)
+    pool.shutdown(wait=False, cancel_futures=True)  # hung workers are abandoned, not joined
+    now = time.time()
+    return [f.result() if f.done() else
+            {"close_ts": close_ts, "offset_s": offset_s, "exchange": n, "bid": None, "ask": None,
+             "exchange_ts": None, "received_at": now, "error": "timeout"}
+            for n, f in futures.items()]
 
 
 def proxy_mid(rows: list[dict]) -> float | None:
