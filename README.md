@@ -340,6 +340,35 @@ For a bounded manual session instead:
 python3 live_runner.py --hours 3
 ```
 
+## Late-window collection
+
+`late_window.py` records, for each KXBTC15M window closing at C, the BTC-USD
+bid/ask from four exchanges (Coinbase, Kraken, Bitstamp, Gemini) every 5 seconds
+from C-600 s to C, Kalshi order-book snapshots at C-300, C-120, C-60, C-30 and
+C-15 seconds, and later the official strike and settlement values, into
+`data/btc_15m_state_late_window.sqlite3` beside the state file. Missed, late or
+failed offsets are recorded as gaps, never filled. It is paper-only: it makes public read requests and never
+places an order. On the VM it runs as `kalshi-late-window.service` (see
+[`deploy/README.md`](deploy/README.md)).
+
+Analyse an exported backup offline; the report is read-only:
+
+```bash
+python3 late_window_report.py /path/to/btc_15m_state_late_window.sqlite3 > report.json
+```
+
+The decision rule is pre-registered in
+[`docs/superpowers/specs/2026-10-24-late-window-snapshots-design.md`](docs/superpowers/specs/2026-10-24-late-window-snapshots-design.md)
+and **must not be changed after collection starts**: edge of at least 5 cents after
+the 3 cent cost, ask size of at least 25, C-30 as the primary offset, and success
+means a mean above zero with a lower 95% day-bootstrap bound above zero over at
+least 20 UTC days and 1,000 windows. It runs only after the proxy check passes: at
+least 500 windows, at least 98% agreement with the official settlement, and a
+median error of at most 2 bps. A window is eligible at snapshot time t when it has
+official values, a valid snapshot at t with both asks strictly between 0 and 1, and
+valid probability inputs, which use only data at or before t. A complete
+settlement average is required only by the proxy check, not by the backtest.
+
 ## Oracle Cloud Ubuntu deployment
 
 The Linux deployment is in [`deploy/README.md`](deploy/README.md). The current

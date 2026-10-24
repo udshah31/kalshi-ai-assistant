@@ -20,6 +20,7 @@ from typing import BinaryIO
 
 from btc_predictor import load_state, state_transaction
 from forecast_archive import READABLE_SCHEMA_VERSIONS, archive_path
+from late_window import late_window_path
 
 BACKUP_NAME = re.compile(r"btc15m-backup-\d{8}T\d{12}Z-[0-9a-f]{8}")
 
@@ -44,7 +45,7 @@ def verify_backup(directory: str | Path) -> dict:
     if not isinstance(manifest, dict) or manifest.get("kind") != "btc15m_backup" or manifest.get("schema_version") != 1:
         raise ValueError("Unsupported backup manifest")
     files = manifest.get("files")
-    if not isinstance(files, dict) or set(files) != {"state", "archive"}:
+    if not isinstance(files, dict) or set(files) not in ({"state", "archive"}, {"state", "archive", "late_window"}):
         raise ValueError("Incomplete backup manifest")
     paths = {}
     for role, entry in files.items():
@@ -68,7 +69,32 @@ def verify_backup(directory: str | Path) -> dict:
         version = connection.execute("SELECT value FROM archive_metadata WHERE key='schema_version'").fetchone()
         if version not in {(str(value),) for value in READABLE_SCHEMA_VERSIONS}:
             raise ValueError("Unsupported backup archive schema")
+    if "late_window" in paths:
+        if paths["late_window"].name != late_window_path(paths["state"]).name:
+            raise ValueError("Backup late-window store does not match the state filename")
+        _check_store(paths["late_window"])
     return manifest
+
+
+def _check_store(path: Path) -> None:
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise ValueError("Backup late-window store integrity check failed")
+            if connection.execute("SELECT value FROM store_metadata WHERE key='schema_version'").fetchone() != ("1",):
+                raise ValueError("Unsupported backup late-window store schema")
+    except sqlite3.Error as exc:
+        raise ValueError(f"Backup late-window store unreadable: {exc}") from exc
+
+
+def _copy_sqlite(source: Path, target: Path) -> None:
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as reader:
+        with closing(sqlite3.connect(target)) as writer:
+            reader.backup(writer)
+            writer.execute("PRAGMA journal_mode=DELETE")
+    os.chmod(target, 0o600)
+    with target.open("rb") as handle:
+        os.fsync(handle.fileno())
 
 
 def _prune(directory: Path, source: Path, keep: int) -> None:
@@ -94,6 +120,7 @@ def create_backup(state_file: str | Path, backup_dir: str | Path, keep: int = 7)
         raise ValueError("keep must be a positive integer")
     state_file = Path(state_file).resolve()
     archive = archive_path(state_file)
+    late = late_window_path(state_file)
     for source in (state_file, archive):
         if not source.is_file():
             raise FileNotFoundError(f"Required evidence file missing: {source}")
@@ -108,24 +135,31 @@ def create_backup(state_file: str | Path, backup_dir: str | Path, keep: int = 7)
                 _, state = load_state(state_file)
                 _write(staging / state_file.name, state_file.read_bytes())
                 copied_archive = staging / archive.name
-                with closing(sqlite3.connect(archive.as_uri() + "?mode=ro", uri=True)) as source:
-                    with closing(sqlite3.connect(copied_archive)) as target:
-                        source.backup(target)
-                        target.execute("PRAGMA journal_mode=DELETE")
-                os.chmod(copied_archive, 0o600)
-                with copied_archive.open("rb") as handle:
-                    os.fsync(handle.fileno())
-                created = datetime.now(timezone.utc)
-                manifest = {
-                    "schema_version": 1, "kind": "btc15m_backup",
-                    "created_at": created.isoformat(), "state_id": state.get("state_id"),
-                    "source_state_file": str(state_file),
-                    "files": {
-                        "state": {"name": state_file.name, "sha256": _digest(staging / state_file.name)},
-                        "archive": {"name": archive.name, "sha256": _digest(copied_archive)},
-                    },
-                }
-                _write(staging / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
+                _copy_sqlite(archive, copied_archive)
+            # The collector takes no state lock and SQLite backup is self-consistent, so the growing store is
+            # copied after the lock is released. It is optional: a bad store never blocks the pair backup.
+            copied_late = staging / late.name
+            if late.is_file():
+                try:
+                    _copy_sqlite(late, copied_late)
+                    _check_store(copied_late)
+                except Exception as exc:
+                    for suffix in ("", "-journal", "-wal", "-shm"):
+                        Path(f"{copied_late}{suffix}").unlink(missing_ok=True)
+                    print(f"backup: late-window store skipped: {exc}", file=sys.stderr)
+            created = datetime.now(timezone.utc)
+            manifest = {
+                "schema_version": 1, "kind": "btc15m_backup",
+                "created_at": created.isoformat(), "state_id": state.get("state_id"),
+                "source_state_file": str(state_file),
+                "files": {
+                    "state": {"name": state_file.name, "sha256": _digest(staging / state_file.name)},
+                    "archive": {"name": archive.name, "sha256": _digest(copied_archive)},
+                },
+            }
+            if copied_late.exists():
+                manifest["files"]["late_window"] = {"name": late.name, "sha256": _digest(copied_late)}
+            _write(staging / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
             verify_backup(staging)
             destination = backup_dir / ("btc15m-backup-" + created.strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8])
             descriptor = os.open(staging, os.O_RDONLY)

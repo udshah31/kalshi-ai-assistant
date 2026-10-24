@@ -63,12 +63,14 @@ jobs:
           required = {
               "btc_predictor.py",
               "backup_state.py",
+              "late_window.py",
               "deploy/install.sh",
               "deploy/oracle-deploy.sh",
               "deploy/oracle-container-deploy.sh",
               "deploy/oracle-rollback.sh",
               "deploy/container-python",
               "deploy/container-systemd/kalshi-runner.service",
+              "deploy/container-systemd/kalshi-late-window.service",
           }
           missing = sorted(required - set(names))
           if missing:

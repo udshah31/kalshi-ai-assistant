@@ -10,7 +10,9 @@ ARCHIVE_FILE="$STATE_ROOT/btc_15m_state_archive.sqlite3"
 BACKUP_ROOT="$STATE_ROOT/backups"
 ROLLBACK_ROOT="$STATE_ROOT/deploy-rollbacks"
 
-APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service)
+APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service kalshi-late-window.service)
+# Added after the first releases: older retained releases and hosts may lack it.
+NEW_UNITS=(kalshi-late-window.service)
 SCHEDULED_UNITS=(
     kalshi-backup.timer
     kalshi-backup.service
@@ -56,7 +58,7 @@ TARGET_CODE="$TARGET/kalshi"
 TARGET_UNITS="$TARGET/systemd"
 [[ -d "$TARGET_CODE" ]] || fail "rollback code tree does not exist: $TARGET_CODE"
 for unit in "${ALL_UNITS[@]}"; do
-    [[ -f "$TARGET_UNITS/$unit" ]] || fail "rollback unit is missing: $unit"
+    [[ " ${NEW_UNITS[*]} " == *" $unit "* || -f "$TARGET_UNITS/$unit" ]] || fail "rollback unit is missing: $unit"
 done
 
 LOCK_FILE="$STATE_ROOT/.kalshi-deploy.lock"
@@ -73,19 +75,42 @@ COMMITTED=0
 SERVICES_STOPPED=0
 CODE_MOVED=0
 
-stop_all() {
-    systemctl stop "${ALL_UNITS[@]}"
+# Only units installed on the host: a unit new in a release is absent before it.
+installed_units() {
+    local unit
+    for unit in "$@"; do
+        [[ -f "$SYSTEMD_ROOT/$unit" ]] && printf '%s\n' "$unit"
+    done
+    return 0
 }
 
+stop_all() {
+    local unit
+    local units=()
+    while IFS= read -r unit; do units+=("$unit"); done < <(installed_units "${ALL_UNITS[@]}")
+    systemctl stop "${units[@]}"
+}
+
+# The collector starts only when the operator enabled it.
 start_all() {
-    systemctl start "${APP_SERVICES[@]}" kalshi-backup.timer kalshi-context-comparison.timer
+    local unit
+    local units=()
+    while IFS= read -r unit; do
+        if [[ "$unit" == kalshi-late-window.service ]] && ! systemctl is-enabled --quiet "$unit"; then
+            continue
+        fi
+        units+=("$unit")
+    done < <(installed_units "${APP_SERVICES[@]}" kalshi-backup.timer kalshi-context-comparison.timer)
+    systemctl start "${units[@]}"
 }
 
 save_units() {
     local destination=$1
     local unit
     for unit in "${ALL_UNITS[@]}"; do
-        install -o root -g root -m 0644 "$SYSTEMD_ROOT/$unit" "$destination/$unit"
+        if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then
+            install -o root -g root -m 0644 "$SYSTEMD_ROOT/$unit" "$destination/$unit" || return 1
+        fi
     done
 }
 
@@ -93,7 +118,15 @@ restore_units() {
     local source=$1
     local unit
     for unit in "${ALL_UNITS[@]}"; do
-        install -o root -g root -m 0644 "$source/$unit" "$SYSTEMD_ROOT/$unit" || return 1
+        if [[ -f "$source/$unit" ]]; then
+            install -o root -g root -m 0644 "$source/$unit" "$SYSTEMD_ROOT/$unit" || return 1
+        else
+            # Unit absent from that release: stop it for good and remove it.
+            if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then
+                systemctl disable --now "$unit" >/dev/null 2>&1 || true
+                rm -f -- "$SYSTEMD_ROOT/$unit" || return 1
+            fi
+        fi
     done
 }
 

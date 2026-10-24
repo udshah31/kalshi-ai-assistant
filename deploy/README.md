@@ -238,6 +238,31 @@ When deliberately moving collection back to Oracle, disable/unload the Mac agent
 migrate the latest evidence, then re-enable the VM writer services with
 `sudo systemctl enable --now kalshi-dashboard.service kalshi-runner.service`.
 
+### Late-window collector
+
+`kalshi-late-window.service` records late-window order-book snapshots (paper-only,
+see the README's "Late-window collection") into
+`/var/lib/kalshi/btc_15m_state_late_window.sqlite3`. It is independent of the runner
+and dashboard and is not part of the `/health` check. The first release that
+includes it installs the unit but does not start it; enabling it starts the
+pre-registered collection period, so run this once to begin collection:
+
+```bash
+sudo systemctl enable --now kalshi-late-window.service
+sudo systemctl status kalshi-late-window.service --no-pager
+sudo journalctl -u kalshi-late-window.service -n 30 --no-pager
+sudo systemctl disable --now kalshi-late-window.service   # stop; later deploys will not restart it
+```
+
+Stopping lets the current window finish and be written first. Backups and the
+export below include the store once it exists. A failed release, or a manual
+rollback to a release without it, stops and removes the unit again.
+
+The store grows by about 5 MB a day and is copied into each retained backup.
+After a rollback to a release from before the collector, `backup_state.py export`
+and `verify` reject the newer three-file backups until they age out of retention
+(about seven days); export older backups or roll forward instead.
+
 Inspect recent service logs or restart after a code update:
 
 ```bash

@@ -1,3 +1,4 @@
+import re
 import subprocess
 import os
 import tempfile
@@ -66,6 +67,7 @@ class OracleDeployScriptTests(unittest.TestCase):
         for name in (
             "kalshi-dashboard.service", "kalshi-runner.service",
             "kalshi-backup.service", "kalshi-context-comparison.service",
+            "kalshi-late-window.service",
         ):
             unit = (ROOT / "deploy/container-systemd" / name).read_text(encoding="utf-8")
             self.assertIn("/opt/kalshi/deploy/container-python", unit)
@@ -74,6 +76,87 @@ class OracleDeployScriptTests(unittest.TestCase):
     def test_container_deploy_opens_staged_code_for_the_service_uid(self):
         script = (ROOT / "deploy/oracle-container-deploy.sh").read_text(encoding="utf-8")
         self.assertIn('chmod 0755 "$STAGE"', script)
+
+    def test_late_window_service_is_independent_and_bundled(self):
+        unit = (ROOT / "deploy/container-systemd/kalshi-late-window.service").read_text(encoding="utf-8")
+        self.assertIn("container-python late /opt/kalshi/late_window.py", unit)
+        self.assertIn("--kalshi-series KXBTC15M", unit)
+        self.assertIn("ExecStop=/usr/bin/docker stop --time 30 kalshi-late", unit)
+        self.assertNotIn("kalshi-runner.service", unit)
+        self.assertNotIn("kalshi-dashboard.service", unit)
+        self.assertRegex((ROOT / "deploy/container-python").read_text(encoding="utf-8"),
+                         r"case \"\$job\" in\s+backup\|comparison\|dashboard\|inspect\|late\|runner\)")
+        script = CONTAINER_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("APP_SERVICES=(kalshi-runner.service kalshi-dashboard.service kalshi-late-window.service)", script)
+        self.assertIn("late_window.py", script)
+        self.assertIn("deploy/container-systemd/kalshi-late-window.service", script)
+        self.assertIn("late_window.py", (ROOT / "deploy/package.sh").read_text(encoding="utf-8"))
+        # health stays runner+dashboard only
+        ready = script.split("wait_ready() {")[1].split("\n}\n")[0]
+        self.assertNotIn("late-window", ready)
+
+    def test_container_rollback_removes_units_absent_from_the_previous_release(self):
+        script = CONTAINER_SCRIPT.read_text(encoding="utf-8")
+        # first deploy: unit is not preinstalled, not snapshotted, not stopped/started when absent
+        self.assertIn("NEW_UNITS=(kalshi-late-window.service)", script)
+        self.assertIn('if [[ -f "$SYSTEMD_ROOT/$unit" ]]; then\n        install', script)
+        self.assertIn('if [[ -f "$ROLLBACK_UNITS/$unit" ]]; then', script)
+        self.assertIn('systemctl disable --now "$unit"', script)
+        self.assertIn('rm -f -- "$SYSTEMD_ROOT/$unit"', script)
+        self.assertIn("installed_units", script.split("stop_all() {")[1].split("}")[0])
+        self.assertIn("installed_units", script.split("start_all() {")[1].split("}")[0])
+
+    def test_late_window_start_is_gated_on_enable_in_deploy_and_manual_rollback(self):
+        rollback = ROLLBACK_SCRIPT.parent / "oracle-rollback.sh"
+        for path in (CONTAINER_SCRIPT, rollback):
+            script = path.read_text(encoding="utf-8")
+            start = script.split("start_all() {")[1].split("\n}\n")[0]
+            self.assertRegex(start, r"kalshi-late-window\.service.*is-enabled --quiet")
+            self.assertRegex(script, r"NEW_UNITS=\(kalshi-late-window\.service\)")
+            self.assertRegex(script.split("stop_all() {")[1].split("\n}\n")[0], r"installed_units")
+
+    @staticmethod
+    def _function(path, name):
+        text = Path(path).read_text(encoding="utf-8")
+        match = re.search(rf"^{name}\(\) \{{\n(.*?)^\}}\n", text, re.S | re.M)
+        assert match, name
+        return match.group(0)
+
+    def test_rollback_on_error_captures_failing_status(self):
+        for path in (CONTAINER_SCRIPT, ROLLBACK_SCRIPT.parent / "oracle-rollback.sh", SCRIPT):
+            body = self._function(path, "rollback_on_error").splitlines()[1]
+            self.assertEqual(body.strip(), "local status=$?", path.name)
+        # behaviour: the capture pattern only works as the first statement
+        result = subprocess.run(
+            ["bash", "-c", 'f() { local status=$?; echo "$status"; }; false; f'],
+            text=True, capture_output=True)
+        self.assertEqual(result.stdout.strip(), "1")
+
+    def test_manual_rollback_removes_absent_unit_without_aborting(self):
+        script = ROLLBACK_SCRIPT.parent / "oracle-rollback.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "target").mkdir()
+            (Path(tmp) / "systemd").mkdir()
+            snippet = "\n".join([
+                "set -Eeuo pipefail",
+                f'SYSTEMD_ROOT="{tmp}/systemd"',
+                'ALL_UNITS=(kalshi-late-window.service)',
+                'systemctl() { return 1; }',
+                self._function(script, "restore_units"),
+                f'restore_units "{tmp}/target"',
+                "echo done",
+            ])
+            result = subprocess.run(["bash", "-c", snippet], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("done", result.stdout)
+
+    def test_manual_rollback_disables_and_removes_unit_missing_from_target(self):
+        script = (ROOT / "deploy/oracle-rollback.sh").read_text(encoding="utf-8")
+        self.assertRegex(script, r"APP_SERVICES=\([^)]*kalshi-late-window\.service")
+        restore = script.split("restore_units() {")[1].split("\n}\n")[0]
+        self.assertRegex(restore, r"systemctl disable --now \"\$unit\"")
+        self.assertRegex(restore, r"rm -f -- \"\$SYSTEMD_ROOT/\$unit\"")
+        self.assertRegex(script, r"NEW_UNITS\[\*\]")
 
 
 class OracleDeployTransactionTests(unittest.TestCase):

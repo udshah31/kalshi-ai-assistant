@@ -8,10 +8,12 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 import backup_state
+import late_window
 from btc_predictor import OnlineLogisticRegression, new_state, state_transaction
 from forecast_archive import record_cycle
 
@@ -159,6 +161,83 @@ class BackupStateTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, error.decode())
         with tarfile.open(fileobj=io.BytesIO(output), mode="r:gz") as bundle:
             self.assertIn(destination.name + "/manifest.json", bundle.getnames())
+
+    def _make_store(self):
+        store = late_window.late_window_path(self.state_file)
+        late_window.connect_store(store).close()
+        return store
+
+    def test_backup_includes_late_window_store_when_present(self):
+        store = self._make_store()
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        manifest = backup_state.verify_backup(destination)
+        self.assertEqual(set(manifest["files"]), {"state", "archive", "late_window"})
+        self.assertEqual(manifest["files"]["late_window"]["name"], store.name)
+        self.assertTrue((destination / store.name).is_file())
+
+    def test_backup_without_store_still_verifies(self):
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        manifest = backup_state.verify_backup(destination)
+        self.assertEqual(set(manifest["files"]), {"state", "archive"})
+
+    def test_tampered_store_fails_verification(self):
+        store = self._make_store()
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        copied = destination / store.name
+        with closing(sqlite3.connect(copied)) as connection, connection:
+            connection.execute("UPDATE store_metadata SET value='2' WHERE key='schema_version'")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            backup_state.verify_backup(destination)
+        manifest_file = destination / "manifest.json"
+        manifest = json.loads(manifest_file.read_text())
+        manifest["files"]["late_window"]["sha256"] = backup_state._digest(copied)
+        manifest_file.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "late-window"):
+            backup_state.verify_backup(destination)
+
+    def test_bad_store_is_dropped_and_the_pair_backup_still_verifies(self):
+        store = late_window.late_window_path(self.state_file)
+        for label, data in (("random bytes", bytes(range(256)) * 64), ("empty", b"")):
+            with self.subTest(label):
+                store.write_bytes(data)
+                error = io.StringIO()
+                with redirect_stderr(error):
+                    destination = backup_state.create_backup(self.state_file, self.backups)
+                manifest = backup_state.verify_backup(destination)
+                self.assertEqual(set(manifest["files"]), {"state", "archive"})
+                self.assertFalse(any(p.name.startswith(store.name) for p in destination.iterdir()))
+                self.assertEqual(len(error.getvalue().splitlines()), 1)
+                self.assertIn("late-window store skipped", error.getvalue())
+
+    def test_listed_bad_store_is_rejected_with_value_error(self):
+        store = self._make_store()
+        destination = backup_state.create_backup(self.state_file, self.backups)
+        copied = destination / store.name
+        copied.write_bytes(bytes(range(256)) * 64)
+        manifest_file = destination / "manifest.json"
+        manifest = json.loads(manifest_file.read_text())
+        manifest["files"]["late_window"]["sha256"] = backup_state._digest(copied)
+        manifest_file.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "late-window store unreadable"):
+            backup_state.verify_backup(destination)
+
+    def test_store_is_copied_after_the_state_lock_is_released(self):
+        store = self._make_store()
+        copy, held = backup_state._copy_sqlite, []
+
+        def spy(source, target):
+            if source == store.resolve():
+                with open(f"{self.state_file.resolve()}.lock", "a+") as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        held.append(False)
+                    except BlockingIOError:
+                        held.append(True)
+            copy(source, target)
+        with mock.patch.object(backup_state, "_copy_sqlite", spy):
+            destination = backup_state.create_backup(self.state_file, self.backups)
+        self.assertEqual(held, [False])
+        self.assertIn("late_window", backup_state.verify_backup(destination)["files"])
 
 
 if __name__ == "__main__":
