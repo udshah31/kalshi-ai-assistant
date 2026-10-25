@@ -63,7 +63,7 @@ _COLUMNS = {
     "bars": (
         "product_id", "timestamp", "open", "high", "low", "close", "volume", "observed_at",
     ),
-    "candles": ("product_id", "timestamp", "close", "observed_at"),
+    "candles": ("product_id", "timestamp", "open", "high", "low", "close", "volume", "observed_at"),
 }
 
 TYPESAFE_STATUSES = frozenset({"ok", "error", "unavailable", "skipped", "disabled"})
@@ -536,6 +536,40 @@ def strike_distance(record: dict[str, Any], price: float | None) -> float | None
     return _context_clamp(math.log(price / strike) / sigma, -5.0, 5.0)
 
 
+def _microprice(record: dict[str, Any]) -> float:
+    """Volume-weighted top-of-book microprice; falls back to market_midpoint when sizes are missing/zero."""
+    snapshot = record.get("snapshot") or {}
+    bid, ask = _number(snapshot.get("yes_bid")), _number(snapshot.get("yes_ask"))
+    bid_size, ask_size = _number(snapshot.get("yes_bid_size")), _number(snapshot.get("yes_ask_size"))
+    total_size = (bid_size or 0.0) + (ask_size or 0.0)
+    if (bid is not None and ask is not None and bid_size is not None and ask_size is not None
+            and bid_size >= 0 and ask_size >= 0 and total_size > 0):
+        return _context_clamp((bid * ask_size + ask * bid_size) / total_size, 0.0, 1.0)
+    return record["market_midpoint"]
+
+
+def _garman_klass_strike_distance(
+    record: dict[str, Any],
+    ohlc_candles: Sequence[tuple[float, float, float, float, float, float]],
+    price: float | None,
+) -> float | None:
+    """Strike distance scaled by 15-minute 1m-candle Garman-Klass OHLC volatility; falls back to strike_distance."""
+    strike = _number((record.get("snapshot") or {}).get("target_price"))
+    remaining = record["closed_at"] - record["issued_at"]
+    if price is None or strike is None or strike <= 0 or price <= 0 or remaining <= 0:
+        return None
+    recent = [c for c in ohlc_candles if c[0] + 60 <= record["issued_at"] and c[5] <= record["issued_at"]][-15:]
+    if len(recent) >= 5:
+        gk_var = sum(
+            0.5 * (math.log(c[2] / c[3]) ** 2) - (2.0 * math.log(2.0) - 1.0) * (math.log(c[4] / c[1]) ** 2)
+            for c in recent
+        ) / len(recent)
+        sigma_15m = max(math.sqrt(max(1e-10, gk_var) * 15.0), 0.0005)
+        sigma = sigma_15m * math.sqrt(remaining / INTERVAL_SECONDS)
+        return _context_clamp(math.log(price / strike) / sigma, -5.0, 5.0)
+    return record.get("strike_distance")
+
+
 def _market_model_features(record: dict[str, Any]) -> dict[str, list[float]]:
     market = [_logit(_context_clamp(record["market_midpoint"], .01, .99))]
     strike = [record["strike_distance"]]
@@ -581,15 +615,28 @@ def compare_market_models(
                      for row in rows.get("candles", [])
                      if row["product_id"] == "BTC-USD" and all(_number(row[key]) is not None
                                                                 for key in ("timestamp", "close", "observed_at")))
+    ohlc_candles = sorted(
+        (float(row["timestamp"]), float(row["open"]), float(row["high"]), float(row["low"]),
+         float(row["close"]), float(row["observed_at"]))
+        for row in rows.get("candles", [])
+        if row["product_id"] == "BTC-USD"
+        and all(_number(row.get(key)) is not None for key in ("timestamp", "open", "high", "low", "close", "observed_at"))
+        and float(row["open"]) > 0 and float(row["high"]) >= float(row["low"]) > 0 and float(row["close"]) > 0
+    )
     starts = [candle[0] for candle in candles]
+    ohlc_starts = [candle[0] for candle in ohlc_candles]
     usable = []
     for record in unique:
         if record["features"] is None or record["market_midpoint"] is None:
             continue
         # Only candles that could have closed by issue time and within the age limit.
         low = bisect.bisect_left(starts, record["issued_at"] - 60 - MAX_CANDLE_AGE_SECONDS)
-        record["strike_distance"] = strike_distance(record, _issue_price(candles[low:], record["issued_at"]))
+        issue_price = _issue_price(candles[low:], record["issued_at"])
+        record["strike_distance"] = strike_distance(record, issue_price)
         if record["strike_distance"] is not None:
+            ohlc_low = bisect.bisect_left(ohlc_starts, record["issued_at"] - 16 * 60 - MAX_CANDLE_AGE_SECONDS)
+            record["strike_distance_gk"] = _garman_klass_strike_distance(record, ohlc_candles[ohlc_low:], issue_price)
+            record["microprice"] = _microprice(record)
             usable.append(record)
 
     folds, all_predictions, skipped, delayed, cursor = [], [], 0, set(), 0
@@ -617,7 +664,9 @@ def compare_market_models(
                 "issued_at": record["issued_at"],
                 "label": record["settlement"]["label"] if record["settlement"] else None,
                 "market_midpoint": record["market_midpoint"], "constant_50_percent": 0.5,
+                "microprice": record["microprice"],
                 "strike_formula": _normal_cdf(record["strike_distance"]),
+                "strike_formula_gk": _normal_cdf(record["strike_distance_gk"]),
             }
             prediction.update({name: model.predict_proba(features[name]) for name, model in models.items()})
             predictions.append(prediction)
@@ -636,7 +685,7 @@ def compare_market_models(
         all_predictions.extend(predictions)
         cursor += test_size
 
-    candidates = (*MARKET_MODELS, "strike_formula", "market_midpoint", "constant_50_percent")
+    candidates = (*MARKET_MODELS, "microprice", "strike_formula", "strike_formula_gk", "market_midpoint", "constant_50_percent")
     metrics = {name: _comparison_metrics(all_predictions, name) for name in candidates}
     market_brier = metrics["market_midpoint"]["brier_score"]
     scored = sum(prediction["label"] is not None for prediction in all_predictions)
@@ -646,7 +695,9 @@ def compare_market_models(
         "status": "descriptive_evaluation" if scored else "insufficient_data",
         "configuration": {"train_size": train_size, "test_size": test_size,
                            "fit": f"Newton (IRLS) to convergence; L2 penalty {FIT_PENALTY} on mean log loss",
+                           "microprice": "Volume-weighted top-of-book midpoint (yes_bid * yes_ask_size + yes_ask * yes_bid_size) / total_size",
                            "strike_formula": "Phi(strike feature); no fitted parameters",
+                           "strike_formula_gk": "Phi(Garman-Klass 1m-volatility strike feature); no fitted parameters",
                            "market_feature": "logit(yes midpoint clamped to [0.01, 0.99])",
                            "strike_feature": "log(issue price / strike) / (15m volatility * sqrt(time left / 15m)), clamped to [-5, 5]",
                            "max_candle_age_seconds": MAX_CANDLE_AGE_SECONDS,
@@ -670,7 +721,7 @@ def compare_market_models(
         "brier_minus_market_midpoint": {
             name: (metrics[name]["brier_score"] - market_brier
                    if metrics[name]["brier_score"] is not None and market_brier is not None else None)
-            for name in (*MARKET_MODELS, "strike_formula")
+            for name in (*MARKET_MODELS, "microprice", "strike_formula", "strike_formula_gk")
         },
         "folds": folds,
         "limitations": [

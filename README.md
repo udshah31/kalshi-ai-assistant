@@ -288,8 +288,10 @@ log(issue price / strike) scaled by frozen 15m volatility and time left, where
 the issue price is the latest BTC-USD minute close completed and received by
 issue time, at most 120 seconds old. Each fold fits these models to convergence
 (Newton/IRLS with a small L2 penalty), not with a few SGD epochs, so it takes no
-`--epochs` option. A sixth, untrained `strike_formula` candidate is
-Phi(strike feature): the normal probability of finishing above the strike.
+`--epochs` option. Three untrained candidates are also evaluated: `microprice`
+(volume-weighted top-of-book midpoint), `strike_formula` (Phi of the 3h-volatility
+strike feature), and `strike_formula_gk` (Phi of the strike feature scaled by
+15-minute 1-minute-candle Garman-Klass OHLC volatility).
 All candidates use identical forecasts that
 have frozen features, a fresh issue-time midpoint and a strike distance. `brier_minus_market_midpoint` compares each
 with the raw midpoint; negative is better. A midpoint is not an executable

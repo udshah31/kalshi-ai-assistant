@@ -849,9 +849,15 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(len(report["folds"][0]["weights"]["candles_plus_market"]["weights"]), len(FEATURE_NAMES) + 1)
         prediction = report["folds"][0]["predictions"][0]
         self.assertIn("strike_formula", report["brier_minus_market_midpoint"])
+        self.assertIn("strike_formula_gk", report["brier_minus_market_midpoint"])
+        self.assertIn("microprice", report["brier_minus_market_midpoint"])
         self.assertTrue(0 < prediction["strike_formula"] < 1)
+        self.assertTrue(0 < prediction["strike_formula_gk"] < 1)
+        self.assertTrue(0 < prediction["microprice"] < 1)
         self.assertAlmostEqual(report["brier_minus_market_midpoint"]["market_only"],
                                report["models"]["market_only"]["brier_score"] - report["models"]["market_midpoint"]["brier_score"])
+        self.assertAlmostEqual(report["brier_minus_market_midpoint"]["microprice"],
+                               report["models"]["microprice"]["brier_score"] - report["models"]["market_midpoint"]["brier_score"])
         self.assertEqual(self.archive.read_bytes(), before)
         result = subprocess.run([sys.executable, str(Path(validation.__file__)), "compare-market",
                                  "--archive-file", str(self.archive), "--train-size", "8", "--test-size", "5"],
